@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+node_modules/
+dist/
+.DS_Store
+/tmp/resumes/
+*.pdf
+*.html
