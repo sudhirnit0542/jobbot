@@ -26,52 +26,30 @@ settings = get_settings()
 
 # ─── System Prompt ────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are JobBot — an AI agent that automatically finds and applies to jobs on behalf of candidates.
+APPLY_SYSTEM_PROMPT = """You are JobBot — an AI agent applying to pre-matched jobs on behalf of a candidate.
 
-## YOUR WORKFLOW (follow this order strictly):
+You have been given a list of jobs that already passed the 80% match threshold.
+For each job:
 
-### STEP 1 — SEARCH JOBS
-- Use search_jobs with candidate's skills as query
-- Search all portals: naukri, linkedin, indeed, instahyre, adzuna
-- Save each found job with save_job_to_repo
+1. Use check_already_applied to skip duplicates
+2. Use get_portal_credentials to find existing portal account
+3. Use build_resume to create a tailored PDF resume using the candidate's CV + JD keywords
+4. Use apply_to_job to submit the application
+5. If new account created, use save_portal_credentials to save it
+6. Use record_application to log the result (APPLIED or FAILED)
+7. Use save_resume_to_repo to save the resume record
 
-### STEP 2 — ANALYSE EACH JOB
-- Use fetch_full_jd to get complete job description
-- Use analyse_jd to extract keywords, skills, requirements
+IMPORTANT:
+- The candidate may have uploaded a PDF CV — use base_resume_text field which contains it
+- Always reference both the CV content and JD keywords when building the resume
+- Report progress clearly: ✅ Applied | ❌ Failed | ⏭ Already applied
 
-### STEP 3 — MATCH CANDIDATE
-- Use match_candidate_to_jd to score candidate vs JD
-- ONLY PROCEED if score >= 80
-- If score < 80, record as SKIPPED and move to next job
+Be concise. Report each job result on one line."""
 
-### STEP 4 — BUILD RESUME
-- Use build_resume to create a tailored PDF resume
-- Resume will have JD keywords injected and skills reordered
-- Save resume with save_resume_to_repo
-
-### STEP 5 — CHECK & APPLY
-- Use check_already_applied to avoid duplicates
-- Use get_portal_credentials to find existing account
-- Use apply_to_job to submit application
-- If new account created, save with save_portal_credentials
-
-### STEP 6 — RECORD
-- Use record_application to save result (APPLIED or FAILED)
-- Continue to next job
-
-## RULES:
-- NEVER apply if match score < 80
-- NEVER apply to same job twice (check_already_applied)
-- ALWAYS save every job found (even if not applied)
-- ALWAYS save credentials when new account created
-- Tell user progress: "Searching... Found X jobs... Matched Y... Applied to Z"
-
-## STYLE: Be concise, report progress clearly, use ✅ ❌ ⏭ for status."""
 
 # ─── Tools ────────────────────────────────────────────────────────────────────
 
 ALL_TOOLS = [
-    search_jobs,
     fetch_full_jd,
     analyse_jd,
     match_candidate_to_jd,
@@ -85,6 +63,7 @@ ALL_TOOLS = [
     check_already_applied,
     get_application_dashboard,
 ]
+
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -160,7 +139,7 @@ def build_agent():
     async def call_model(state: AgentState):
         messages = list(state["messages"])
         if not any(isinstance(m, SystemMessage) for m in messages):
-            messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+            messages = [SystemMessage(content=APPLY_SYSTEM_PROMPT)] + messages
         response = await invoke_with_fallback(llm_chain, messages)
         return {"messages": [response]}
 
@@ -176,7 +155,74 @@ def build_agent():
 job_agent = build_agent()
 
 
-# ─── Chat Interface ───────────────────────────────────────────────────────────
+# ─── Auto Apply (Step 2) ─────────────────────────────────────────────────────
+
+async def run_auto_apply(
+    candidate: dict,
+    job_ids: list[str],
+    session_id: str,
+    history: list = None,
+) -> tuple[str, list]:
+    """
+    Apply to a pre-filtered list of jobs (already scored ≥80%).
+    Fetches each job from DB, builds tailored resume referencing CV, applies.
+    """
+    import json
+    from db.supabase_client import supabase
+
+    history = history or []
+
+    # Fetch full job details from DB
+    jobs = []
+    for job_id in job_ids:
+        try:
+            r = supabase.table("jobs").select("*").eq("id", job_id).single().execute()
+            if r.data:
+                jobs.append(r.data)
+        except Exception as e:
+            logger.warning(f"Could not fetch job {job_id}: {e}")
+
+    if not jobs:
+        return "No valid jobs to apply to.", history
+
+    # Check if candidate has a PDF CV uploaded
+    has_pdf_cv = candidate.get("base_resume_text", "").startswith("PDF:")
+
+    prompt = f"""Apply to these {len(jobs)} pre-matched jobs for the candidate.
+
+CANDIDATE PROFILE:
+{json.dumps({k: v for k, v in candidate.items() if k != 'base_resume_text'}, indent=2)}
+
+{"CANDIDATE HAS UPLOADED A PDF CV — use base_resume_text field when building resumes" if has_pdf_cv else "No PDF CV uploaded — use profile data only"}
+
+JOBS TO APPLY (all have ≥80% match score already verified):
+{json.dumps([{"id": j.get("id"), "title": j.get("title"), "company": j.get("company"),
+              "portal": j.get("portal"), "apply_url": j.get("apply_url"),
+              "description": (j.get("description") or "")[:500]} for j in jobs], indent=2)}
+
+For each job:
+1. check_already_applied first
+2. get_portal_credentials for the portal
+3. build_resume using candidate profile + JD keywords {"+ CV content from base_resume_text" if has_pdf_cv else ""}
+4. apply_to_job
+5. save credentials if new account created
+6. record_application with result
+7. save_resume_to_repo
+
+Report each result clearly."""
+
+    messages = [HumanMessage(content=prompt)]
+    result = await job_agent.ainvoke({"messages": messages})
+    response = result["messages"][-1].content
+
+    updated_history = history + [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": response}
+    ]
+    return response, updated_history
+
+
+# ─── Legacy full search+apply (kept for compatibility) ───────────────────────
 
 async def run_job_search(
     candidate: dict,
@@ -184,18 +230,7 @@ async def run_job_search(
     location: str = "India",
     history: list = None
 ) -> tuple[str, list]:
-    """
-    Run the full job search and application workflow.
-
-    Args:
-        candidate: Full candidate profile dict
-        job_query: e.g. "Python Developer", "React Frontend Engineer"
-        location: Location preference
-        history: Conversation history
-
-    Returns:
-        Final response text and updated history
-    """
+    """Original single-step search+apply flow (kept for backwards compat)."""
     import json
 
     history = history or []
@@ -203,24 +238,13 @@ async def run_job_search(
                 else AIMessage(content=m["content"])
                 for m in history]
 
-    prompt = f"""Start the job search workflow for this candidate:
+    prompt = f"""Search and apply for {job_query} jobs in {location} for this candidate.
+Only apply to jobs with match score >= {settings.min_match_score}%.
 
-CANDIDATE PROFILE:
-{json.dumps(candidate, indent=2)}
-
-SEARCH QUERY: {job_query}
-LOCATION: {location}
-MIN MATCH SCORE: {settings.min_match_score}%
-
-Please:
-1. Search for {job_query} jobs in {location} across all portals
-2. For each job, analyse JD, score match, skip if < {settings.min_match_score}%
-3. For matching jobs, build tailored resume and apply
-4. Report progress at each step
-5. Give final summary: X jobs found, Y matched, Z applied"""
+CANDIDATE:
+{json.dumps(candidate, indent=2)}"""
 
     messages.append(HumanMessage(content=prompt))
-
     result = await job_agent.ainvoke({"messages": messages})
     response = result["messages"][-1].content
 

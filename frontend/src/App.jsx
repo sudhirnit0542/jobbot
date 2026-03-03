@@ -1,31 +1,40 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000"
 
 const STATUS_COLORS = {
-  APPLIED: { bg: "#d4edda", text: "#155724", dot: "#28a745" },
-  FAILED: { bg: "#f8d7da", text: "#721c24", dot: "#dc3545" },
-  SKIPPED: { bg: "#fff3cd", text: "#856404", dot: "#ffc107" },
-  PENDING: { bg: "#e2e3e5", text: "#383d41", dot: "#6c757d" },
+  APPLIED:   { bg: "#d4edda", text: "#155724", dot: "#28a745" },
+  FAILED:    { bg: "#f8d7da", text: "#721c24", dot: "#dc3545" },
+  SKIPPED:   { bg: "#fff3cd", text: "#856404", dot: "#ffc107" },
+  PENDING:   { bg: "#e2e3e5", text: "#383d41", dot: "#6c757d" },
   INTERVIEW: { bg: "#cce5ff", text: "#004085", dot: "#007bff" },
-  OFFER: { bg: "#d4edda", text: "#155724", dot: "#20c997" },
+  OFFER:     { bg: "#d4edda", text: "#155724", dot: "#20c997" },
 }
 
 export default function App() {
-  const [tab, setTab] = useState("search")
+  const [tab, setTab] = useState("profile")
   const [candidateId, setCandidateId] = useState(localStorage.getItem("jobbot_candidate_id") || "")
   const [candidate, setCandidate] = useState(null)
   const [applications, setApplications] = useState([])
+  const [saving, setSaving] = useState(false)
+  const [uploadingPdf, setUploadingPdf] = useState(false)
+  const [pdfUploaded, setPdfUploaded] = useState(false)
+  const fileInputRef = useRef(null)
+
+  // Search flow state
+  const [searchForm, setSearchForm] = useState({ job_query: "", location: "India" })
+  const [searchResults, setSearchResults] = useState(null)   // jobs found
   const [searching, setSearching] = useState(false)
-  const [searchResult, setSearchResult] = useState(null)
+  const [applying, setApplying] = useState(false)
+  const [applyResults, setApplyResults] = useState(null)
+  const [sessionId, setSessionId] = useState(null)
+
   const [profileForm, setProfileForm] = useState({
     name: "", email: "", phone: "", location: "",
     linkedin_url: "", github_url: "",
     skills: "", experience_years: 0, summary: "",
     experience: [], education: [], certifications: []
   })
-  const [searchForm, setSearchForm] = useState({ job_query: "", location: "India" })
-  const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     if (candidateId) {
@@ -40,6 +49,7 @@ export default function App() {
       if (r.ok) {
         const data = await r.json()
         setCandidate(data)
+        setPdfUploaded(!!data.base_resume_text && data.base_resume_text.length > 200)
         setProfileForm({
           ...data,
           skills: Array.isArray(data.skills) ? data.skills.join(", ") : data.skills || ""
@@ -58,7 +68,55 @@ export default function App() {
     } catch (e) { console.error(e) }
   }
 
+  // ── Upload PDF CV ──────────────────────────────────────────────────────────
+  const handlePdfUpload = async (file) => {
+    if (!file || file.type !== "application/pdf") {
+      alert("Please upload a PDF file")
+      return
+    }
+    if (!candidateId) {
+      alert("Please save your basic profile first, then upload your CV")
+      return
+    }
+    setUploadingPdf(true)
+    try {
+      const formData = new FormData()
+      formData.append("file", file)
+      const r = await fetch(`${API}/candidate/${candidateId}/upload-cv`, {
+        method: "POST",
+        body: formData,
+      })
+      if (r.ok) {
+        const data = await r.json()
+        setPdfUploaded(true)
+        // Update skills and summary if extracted from PDF
+        if (data.extracted_skills?.length) {
+          setProfileForm(p => ({
+            ...p,
+            skills: data.extracted_skills.join(", "),
+            summary: data.extracted_summary || p.summary,
+          }))
+          alert(`✅ CV uploaded! Extracted ${data.extracted_skills.length} skills automatically.`)
+        } else {
+          alert("✅ CV uploaded successfully!")
+        }
+        fetchCandidate()
+      } else {
+        const err = await r.json()
+        alert(`Upload failed: ${err.detail || "Unknown error"}`)
+      }
+    } catch (e) {
+      alert("Upload failed — check your connection")
+    }
+    setUploadingPdf(false)
+  }
+
+  // ── Save Profile ───────────────────────────────────────────────────────────
   const saveProfile = async () => {
+    if (!profileForm.name || !profileForm.email) {
+      alert("Name and Email are required")
+      return
+    }
     setSaving(true)
     try {
       const payload = {
@@ -66,7 +124,8 @@ export default function App() {
         skills: profileForm.skills.split(",").map(s => s.trim()).filter(Boolean),
       }
       const r = await fetch(`${API}/candidate`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
       })
       if (r.ok) {
@@ -83,27 +142,53 @@ export default function App() {
     setSaving(false)
   }
 
-  const startSearch = async () => {
+  // ── Step 1: Search Jobs ────────────────────────────────────────────────────
+  const searchJobs = async () => {
     if (!candidateId) return alert("Save your profile first!")
-    if (!searchForm.job_query) return alert("Enter a job title or skill to search")
+    if (!searchForm.job_query) return alert("Enter a job title or skill")
     setSearching(true)
-    setSearchResult(null)
+    setSearchResults(null)
+    setApplyResults(null)
     try {
-      const r = await fetch(`${API}/search/start`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+      const r = await fetch(`${API}/search/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ candidate_id: candidateId, ...searchForm })
       })
       if (r.ok) {
         const data = await r.json()
-        setSearchResult(data)
-        // Poll for applications every 10 seconds
-        const interval = setInterval(async () => {
-          await fetchApplications()
-        }, 10000)
-        setTimeout(() => clearInterval(interval), 300000) // Stop after 5 min
+        setSearchResults(data)
+      } else {
+        alert("Search failed — try again")
       }
-    } catch (e) { setSearchResult({ error: "Search failed" }) }
+    } catch (e) { alert("Search failed") }
     setSearching(false)
+  }
+
+  // ── Step 2: Auto Apply ─────────────────────────────────────────────────────
+  const startAutoApply = async () => {
+    if (!searchResults?.session_id) return
+    setApplying(true)
+    setApplyResults(null)
+    try {
+      const r = await fetch(`${API}/search/apply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          candidate_id: candidateId,
+          session_id: searchResults.session_id,
+          job_ids: searchResults.jobs.filter(j => j.match_score >= 80).map(j => j.job_id)
+        })
+      })
+      if (r.ok) {
+        const data = await r.json()
+        setApplyResults(data)
+        // Poll applications every 8 seconds
+        const interval = setInterval(fetchApplications, 8000)
+        setTimeout(() => clearInterval(interval), 300000)
+      }
+    } catch (e) { alert("Auto-apply failed") }
+    setApplying(false)
   }
 
   const summary = {
@@ -113,6 +198,10 @@ export default function App() {
     failed: applications.filter(a => a.status === "FAILED").length,
     interview: applications.filter(a => a.status === "INTERVIEW").length,
   }
+
+  const matchedJobs = searchResults?.jobs?.filter(j => j.match_score >= 80) || []
+  const reviewJobs = searchResults?.jobs?.filter(j => j.match_score >= 60 && j.match_score < 80) || []
+  const skippedJobs = searchResults?.jobs?.filter(j => j.match_score < 60) || []
 
   return (
     <div style={{ fontFamily: "'Segoe UI', sans-serif", minHeight: "100vh", background: "#f0f4f8" }}>
@@ -128,6 +217,7 @@ export default function App() {
             <div style={{ textAlign: "right", fontSize: 13 }}>
               <div style={{ fontWeight: 600 }}>{candidate.name}</div>
               <div style={{ opacity: 0.8 }}>{candidate.email}</div>
+              {pdfUploaded && <div style={{ opacity: 0.7, fontSize: 11 }}>📄 CV uploaded</div>}
             </div>
           )}
         </div>
@@ -150,137 +240,264 @@ export default function App() {
 
         {/* ── PROFILE TAB ── */}
         {tab === "profile" && (
-          <div style={{ background: "white", borderRadius: 12, padding: 28, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
-            <h2 style={{ marginBottom: 24, color: "#1a5276" }}>Candidate Profile</h2>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
-              {[
-                ["name", "Full Name *", "text"],
-                ["email", "Email Address *", "email"],
-                ["phone", "Phone Number", "text"],
-                ["location", "Location (City)", "text"],
-                ["linkedin_url", "LinkedIn URL", "url"],
-                ["github_url", "GitHub URL", "url"],
-              ].map(([field, label, type]) => (
-                <div key={field}>
-                  <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>{label}</label>
-                  <input type={type} value={profileForm[field] || ""} onChange={e => setProfileForm(p => ({ ...p, [field]: e.target.value }))}
-                    style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14, boxSizing: "border-box" }} />
-                </div>
-              ))}
-            </div>
-
-            <div style={{ marginTop: 18 }}>
-              <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>
-                Skills (comma separated) *
-              </label>
-              <input value={profileForm.skills} onChange={e => setProfileForm(p => ({ ...p, skills: e.target.value }))}
-                placeholder="Python, FastAPI, React, PostgreSQL, Docker, AWS..."
-                style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14 }} />
-            </div>
-
-            <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 4fr", gap: 18 }}>
-              <div>
-                <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>Years of Experience</label>
-                <input type="number" value={profileForm.experience_years} min={0} max={40}
-                  onChange={e => setProfileForm(p => ({ ...p, experience_years: parseInt(e.target.value) || 0 }))}
-                  style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14 }} />
-              </div>
-              <div>
-                <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>Professional Summary</label>
-                <textarea value={profileForm.summary} rows={2}
-                  onChange={e => setProfileForm(p => ({ ...p, summary: e.target.value }))}
-                  placeholder="Brief summary of your experience and expertise..."
-                  style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14, resize: "vertical" }} />
-              </div>
-            </div>
-
-            {/* Experience Section */}
-            <div style={{ marginTop: 24, borderTop: "1px solid #eee", paddingTop: 20 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                <h3 style={{ color: "#1a5276", fontSize: 15 }}>Work Experience</h3>
-                <button onClick={() => setProfileForm(p => ({ ...p, experience: [...p.experience, { role: "", company: "", duration: "", description: "", achievements: [] }] }))}
-                  style={{ background: "#2980b9", color: "white", border: "none", borderRadius: 6, padding: "6px 14px", cursor: "pointer", fontSize: 13 }}>
-                  + Add Experience
-                </button>
-              </div>
-              {profileForm.experience.map((exp, i) => (
-                <div key={i} style={{ background: "#f8f9fa", borderRadius: 8, padding: 16, marginBottom: 12 }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 10 }}>
-                    {[["role", "Job Title"], ["company", "Company"], ["duration", "Duration (e.g. 2021-2023)"]].map(([field, placeholder]) => (
-                      <input key={field} value={exp[field] || ""} placeholder={placeholder}
-                        onChange={e => { const updated = [...profileForm.experience]; updated[i] = { ...updated[i], [field]: e.target.value }; setProfileForm(p => ({ ...p, experience: updated })) }}
-                        style={{ padding: "8px 10px", border: "1px solid #ddd", borderRadius: 5, fontSize: 13 }} />
-                    ))}
+          <div>
+            {/* CV Upload Card */}
+            <div style={{ background: "white", borderRadius: 12, padding: 24, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", marginBottom: 20, border: pdfUploaded ? "2px solid #28a745" : "2px dashed #aed6f1" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 15, color: "#1a5276", marginBottom: 4 }}>
+                    📄 Upload Your CV (PDF)
                   </div>
-                  <textarea value={exp.description || ""} placeholder="Describe your role and responsibilities..."
-                    onChange={e => { const updated = [...profileForm.experience]; updated[i] = { ...updated[i], description: e.target.value }; setProfileForm(p => ({ ...p, experience: updated })) }}
-                    style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 5, fontSize: 13, resize: "vertical", marginBottom: 6 }} rows={2} />
-                  <input value={(exp.achievements || []).join("; ")} placeholder="Key achievements (separated by semicolons)"
-                    onChange={e => { const updated = [...profileForm.experience]; updated[i] = { ...updated[i], achievements: e.target.value.split(";").map(s => s.trim()).filter(Boolean) }; setProfileForm(p => ({ ...p, experience: updated })) }}
-                    style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 5, fontSize: 13 }} />
+                  <div style={{ fontSize: 13, color: "#666" }}>
+                    {pdfUploaded
+                      ? "✅ CV uploaded — skills and experience will be referenced for job matching and resume tailoring"
+                      : "Upload your existing CV to auto-extract skills and use as reference when building tailored resumes"}
+                  </div>
                 </div>
-              ))}
+                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  {pdfUploaded && (
+                    <span style={{ background: "#d4edda", color: "#155724", borderRadius: 20, padding: "4px 14px", fontSize: 12, fontWeight: 500 }}>
+                      ✅ CV on file
+                    </span>
+                  )}
+                  <input
+                    type="file" accept=".pdf" ref={fileInputRef} style={{ display: "none" }}
+                    onChange={e => e.target.files[0] && handlePdfUpload(e.target.files[0])}
+                  />
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploadingPdf}
+                    style={{ background: pdfUploaded ? "#f8f9fa" : "linear-gradient(135deg, #1a5276, #2980b9)",
+                             color: pdfUploaded ? "#333" : "white", border: pdfUploaded ? "1px solid #ddd" : "none",
+                             borderRadius: 8, padding: "9px 20px", cursor: uploadingPdf ? "not-allowed" : "pointer", fontSize: 13, fontWeight: 500 }}>
+                    {uploadingPdf ? "Uploading..." : pdfUploaded ? "📤 Replace CV" : "📤 Upload CV"}
+                  </button>
+                </div>
+              </div>
             </div>
 
-            <button onClick={saveProfile} disabled={saving}
-              style={{ marginTop: 24, background: saving ? "#aaa" : "linear-gradient(135deg, #1a5276, #2980b9)", color: "white", border: "none",
-                       borderRadius: 8, padding: "12px 32px", fontSize: 15, fontWeight: 600, cursor: saving ? "not-allowed" : "pointer" }}>
-              {saving ? "Saving..." : "💾 Save Profile"}
-            </button>
+            {/* Profile Form */}
+            <div style={{ background: "white", borderRadius: 12, padding: 28, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
+              <h2 style={{ marginBottom: 6, color: "#1a5276" }}>Candidate Profile</h2>
+              <p style={{ color: "#888", fontSize: 13, marginBottom: 22 }}>
+                Fill your profile manually or upload a CV above to auto-populate skills.
+                Both will be used when matching jobs and tailoring resumes.
+              </p>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
+                {[
+                  ["name", "Full Name *", "text"],
+                  ["email", "Email Address *", "email"],
+                  ["phone", "Phone Number", "text"],
+                  ["location", "Location (City)", "text"],
+                  ["linkedin_url", "LinkedIn URL", "url"],
+                  ["github_url", "GitHub URL", "url"],
+                ].map(([field, label, type]) => (
+                  <div key={field}>
+                    <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>{label}</label>
+                    <input type={type} value={profileForm[field] || ""}
+                      onChange={e => setProfileForm(p => ({ ...p, [field]: e.target.value }))}
+                      style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14, boxSizing: "border-box" }} />
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ marginTop: 18 }}>
+                <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>
+                  Skills (comma separated) *
+                </label>
+                <input value={profileForm.skills}
+                  onChange={e => setProfileForm(p => ({ ...p, skills: e.target.value }))}
+                  placeholder="Python, FastAPI, React, PostgreSQL, Docker, AWS..."
+                  style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14 }} />
+                <div style={{ fontSize: 11, color: "#999", marginTop: 3 }}>
+                  💡 These auto-populate when you upload a CV
+                </div>
+              </div>
+
+              <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 4fr", gap: 18 }}>
+                <div>
+                  <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>Years of Exp.</label>
+                  <input type="number" value={profileForm.experience_years} min={0} max={40}
+                    onChange={e => setProfileForm(p => ({ ...p, experience_years: parseInt(e.target.value) || 0 }))}
+                    style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14 }} />
+                </div>
+                <div>
+                  <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>Professional Summary</label>
+                  <textarea value={profileForm.summary} rows={2}
+                    onChange={e => setProfileForm(p => ({ ...p, summary: e.target.value }))}
+                    placeholder="Brief summary of your experience and expertise..."
+                    style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14, resize: "vertical" }} />
+                </div>
+              </div>
+
+              {/* Experience */}
+              <div style={{ marginTop: 24, borderTop: "1px solid #eee", paddingTop: 20 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <h3 style={{ color: "#1a5276", fontSize: 15 }}>Work Experience</h3>
+                  <button onClick={() => setProfileForm(p => ({ ...p, experience: [...p.experience, { role: "", company: "", duration: "", description: "", achievements: [] }] }))}
+                    style={{ background: "#2980b9", color: "white", border: "none", borderRadius: 6, padding: "6px 14px", cursor: "pointer", fontSize: 13 }}>
+                    + Add
+                  </button>
+                </div>
+                {profileForm.experience.map((exp, i) => (
+                  <div key={i} style={{ background: "#f8f9fa", borderRadius: 8, padding: 16, marginBottom: 12 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 10 }}>
+                      {[["role", "Job Title"], ["company", "Company"], ["duration", "Duration"]].map(([field, ph]) => (
+                        <input key={field} value={exp[field] || ""} placeholder={ph}
+                          onChange={e => { const u = [...profileForm.experience]; u[i] = { ...u[i], [field]: e.target.value }; setProfileForm(p => ({ ...p, experience: u })) }}
+                          style={{ padding: "8px 10px", border: "1px solid #ddd", borderRadius: 5, fontSize: 13 }} />
+                      ))}
+                    </div>
+                    <textarea value={exp.description || ""} placeholder="Role description..." rows={2}
+                      onChange={e => { const u = [...profileForm.experience]; u[i] = { ...u[i], description: e.target.value }; setProfileForm(p => ({ ...p, experience: u })) }}
+                      style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 5, fontSize: 13, resize: "vertical", marginBottom: 6 }} />
+                    <input value={(exp.achievements || []).join("; ")} placeholder="Key achievements (semicolon separated)"
+                      onChange={e => { const u = [...profileForm.experience]; u[i] = { ...u[i], achievements: e.target.value.split(";").map(s => s.trim()).filter(Boolean) }; setProfileForm(p => ({ ...p, experience: u })) }}
+                      style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 5, fontSize: 13 }} />
+                  </div>
+                ))}
+              </div>
+
+              <button onClick={saveProfile} disabled={saving}
+                style={{ marginTop: 24, background: saving ? "#aaa" : "linear-gradient(135deg, #1a5276, #2980b9)",
+                         color: "white", border: "none", borderRadius: 8, padding: "12px 32px",
+                         fontSize: 15, fontWeight: 600, cursor: saving ? "not-allowed" : "pointer" }}>
+                {saving ? "Saving..." : "💾 Save Profile"}
+              </button>
+            </div>
           </div>
         )}
 
-        {/* ── SEARCH TAB ── */}
+        {/* ── SEARCH & APPLY TAB ── */}
         {tab === "search" && (
           <div>
+
+            {/* Search Form */}
             <div style={{ background: "white", borderRadius: 12, padding: 28, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", marginBottom: 20 }}>
-              <h2 style={{ marginBottom: 6, color: "#1a5276" }}>🔍 Auto Job Search & Apply</h2>
-              <p style={{ color: "#666", marginBottom: 22, fontSize: 14 }}>
-                JobBot will search Naukri, LinkedIn, Indeed, and Instahyre — then automatically apply to jobs with ≥80% match score.
+              <h2 style={{ marginBottom: 6, color: "#1a5276" }}>🔍 Search Jobs</h2>
+              <p style={{ color: "#666", marginBottom: 20, fontSize: 13 }}>
+                Step 1 — Search and see matching jobs. Step 2 — Review results and click Auto Apply.
               </p>
 
-              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16, marginBottom: 20 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr auto", gap: 14, alignItems: "flex-end" }}>
                 <div>
                   <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>Job Title / Skills</label>
-                  <input value={searchForm.job_query} onChange={e => setSearchForm(p => ({ ...p, job_query: e.target.value }))}
-                    placeholder="e.g. Python Developer, React Frontend Engineer, Data Scientist..."
+                  <input value={searchForm.job_query}
+                    onChange={e => setSearchForm(p => ({ ...p, job_query: e.target.value }))}
+                    onKeyDown={e => e.key === "Enter" && searchJobs()}
+                    placeholder="e.g. Product Manager, Python Developer, Data Scientist..."
                     style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #2980b9", borderRadius: 8, fontSize: 15 }} />
                 </div>
                 <div>
                   <label style={{ display: "block", marginBottom: 5, fontWeight: 500, fontSize: 13, color: "#444" }}>Location</label>
-                  <input value={searchForm.location} onChange={e => setSearchForm(p => ({ ...p, location: e.target.value }))}
-                    placeholder="India, Bangalore, Remote..."
-                    style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #ddd", borderRadius: 8, fontSize: 15 }} />
+                  <input value={searchForm.location}
+                    onChange={e => setSearchForm(p => ({ ...p, location: e.target.value }))}
+                    placeholder="India / Bangalore / Remote"
+                    style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #ddd", borderRadius: 8, fontSize: 14 }} />
                 </div>
+                <button onClick={searchJobs} disabled={searching || !candidateId}
+                  style={{ background: (searching || !candidateId) ? "#aaa" : "linear-gradient(135deg, #1a5276, #2980b9)",
+                           color: "white", border: "none", borderRadius: 8, padding: "11px 28px",
+                           fontSize: 14, fontWeight: 600, cursor: (searching || !candidateId) ? "not-allowed" : "pointer",
+                           whiteSpace: "nowrap" }}>
+                  {searching ? "Searching..." : "🔍 Search"}
+                </button>
               </div>
 
-              {/* Portals badges */}
-              <div style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 12, color: "#666" }}>Searching on:</span>
+              {!candidateId && <p style={{ color: "#dc3545", fontSize: 13, marginTop: 8 }}>⚠️ Save your profile first</p>}
+
+              <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, color: "#888" }}>Searching on:</span>
                 {["Naukri", "LinkedIn", "Indeed", "Instahyre", "Adzuna"].map(p => (
-                  <span key={p} style={{ background: "#eaf4fb", border: "1px solid #aed6f1", borderRadius: 20, padding: "3px 12px", fontSize: 12, color: "#2980b9" }}>✓ {p}</span>
+                  <span key={p} style={{ background: "#eaf4fb", border: "1px solid #aed6f1", borderRadius: 20, padding: "2px 10px", fontSize: 11, color: "#2980b9" }}>✓ {p}</span>
                 ))}
               </div>
-
-              <button onClick={startSearch} disabled={searching || !candidateId}
-                style={{ background: searching ? "#aaa" : "linear-gradient(135deg, #1a5276, #2980b9)", color: "white", border: "none",
-                         borderRadius: 8, padding: "13px 36px", fontSize: 15, fontWeight: 600, cursor: (searching || !candidateId) ? "not-allowed" : "pointer" }}>
-                {searching ? "🔍 Searching & Applying..." : "🚀 Start Auto-Apply"}
-              </button>
-
-              {!candidateId && <p style={{ color: "#dc3545", fontSize: 13, marginTop: 8 }}>⚠️ Please save your profile first</p>}
             </div>
 
-            {searchResult && (
-              <div style={{ background: searchResult.error ? "#f8d7da" : "#d4edda", borderRadius: 12, padding: 20,
-                            border: `1px solid ${searchResult.error ? "#f5c6cb" : "#c3e6cb"}` }}>
-                {searchResult.error ? (
-                  <p style={{ color: "#721c24", margin: 0 }}>❌ {searchResult.error}</p>
-                ) : (
-                  <div>
-                    <p style={{ color: "#155724", fontWeight: 600, margin: "0 0 6px" }}>✅ {searchResult.message}</p>
-                    <p style={{ color: "#155724", margin: 0, fontSize: 13 }}>Session ID: {searchResult.session_id} — Running in background. Switch to Applications tab to track progress.</p>
+            {/* Search Results */}
+            {searchResults && (
+              <div>
+                {/* Summary bar */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
+                  {[
+                    ["Jobs Found", searchResults.total_found, "#2980b9"],
+                    ["✅ Strong Match (≥80%)", matchedJobs.length, "#28a745"],
+                    ["🔶 Review (60-79%)", reviewJobs.length, "#ffc107"],
+                    ["⏭ Low Match (<60%)", skippedJobs.length, "#aaa"],
+                  ].map(([label, count, color]) => (
+                    <div key={label} style={{ background: "white", borderRadius: 10, padding: "14px 18px",
+                                             boxShadow: "0 2px 6px rgba(0,0,0,0.07)", borderTop: `3px solid ${color}` }}>
+                      <div style={{ fontSize: 26, fontWeight: 700, color }}>{count}</div>
+                      <div style={{ fontSize: 12, color: "#666", marginTop: 2 }}>{label}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Auto Apply CTA */}
+                {matchedJobs.length > 0 && (
+                  <div style={{ background: "linear-gradient(135deg, #1a5276, #2980b9)", borderRadius: 12,
+                               padding: "20px 28px", marginBottom: 20, display: "flex",
+                               justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ color: "white" }}>
+                      <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 3 }}>
+                        🚀 Ready to Auto-Apply to {matchedJobs.length} matched jobs?
+                      </div>
+                      <div style={{ fontSize: 13, opacity: 0.85 }}>
+                        JobBot will build tailored resumes and apply to all jobs with ≥80% match score
+                      </div>
+                    </div>
+                    <button onClick={startAutoApply} disabled={applying}
+                      style={{ background: applying ? "#aaa" : "white",
+                               color: applying ? "white" : "#1a5276",
+                               border: "none", borderRadius: 8, padding: "12px 28px",
+                               fontSize: 14, fontWeight: 700, cursor: applying ? "not-allowed" : "pointer",
+                               whiteSpace: "nowrap", minWidth: 160 }}>
+                      {applying ? "⏳ Applying..." : "⚡ Auto Apply Now"}
+                    </button>
                   </div>
+                )}
+
+                {/* Apply Results banner */}
+                {applyResults && (
+                  <div style={{ background: "#d4edda", borderRadius: 10, padding: "14px 20px", marginBottom: 20,
+                               border: "1px solid #c3e6cb" }}>
+                    <div style={{ fontWeight: 600, color: "#155724", marginBottom: 4 }}>✅ Auto-Apply Started!</div>
+                    <div style={{ fontSize: 13, color: "#155724" }}>
+                      Applying to {matchedJobs.length} jobs in background. Switch to Applications tab to track progress.
+                    </div>
+                  </div>
+                )}
+
+                {/* Strong Match Jobs */}
+                {matchedJobs.length > 0 && (
+                  <div style={{ background: "white", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", marginBottom: 16, overflow: "hidden" }}>
+                    <div style={{ background: "#d4edda", padding: "12px 20px", borderBottom: "1px solid #c3e6cb" }}>
+                      <span style={{ fontWeight: 600, color: "#155724" }}>✅ Strong Match — Will Auto-Apply ({matchedJobs.length} jobs)</span>
+                    </div>
+                    <JobTable jobs={matchedJobs} />
+                  </div>
+                )}
+
+                {/* Review Jobs */}
+                {reviewJobs.length > 0 && (
+                  <div style={{ background: "white", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", marginBottom: 16, overflow: "hidden" }}>
+                    <div style={{ background: "#fff3cd", padding: "12px 20px", borderBottom: "1px solid #ffe8a1" }}>
+                      <span style={{ fontWeight: 600, color: "#856404" }}>🔶 Review These — Close but below 80% ({reviewJobs.length} jobs)</span>
+                    </div>
+                    <JobTable jobs={reviewJobs} />
+                  </div>
+                )}
+
+                {/* Skipped Jobs */}
+                {skippedJobs.length > 0 && (
+                  <details style={{ background: "white", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", overflow: "hidden" }}>
+                    <summary style={{ background: "#f8f9fa", padding: "12px 20px", cursor: "pointer",
+                                     borderBottom: "1px solid #dee2e6", fontWeight: 600, color: "#666", fontSize: 14 }}>
+                      ⏭ Low Match — Skipped ({skippedJobs.length} jobs) — click to expand
+                    </summary>
+                    <JobTable jobs={skippedJobs} />
+                  </details>
                 )}
               </div>
             )}
@@ -290,10 +507,9 @@ export default function App() {
         {/* ── TRACKER TAB ── */}
         {tab === "tracker" && (
           <div>
-            {/* Summary cards */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14, marginBottom: 22 }}>
               {[
-                ["Total Found", summary.total, "#6c757d"],
+                ["Total", summary.total, "#6c757d"],
                 ["Applied", summary.applied, "#28a745"],
                 ["Interview", summary.interview, "#007bff"],
                 ["Skipped", summary.skipped, "#ffc107"],
@@ -307,26 +523,26 @@ export default function App() {
               ))}
             </div>
 
-            {/* Refresh button */}
             <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
-              <button onClick={fetchApplications} style={{ background: "#f8f9fa", border: "1px solid #ddd",
-                borderRadius: 6, padding: "7px 16px", cursor: "pointer", fontSize: 13 }}>🔄 Refresh</button>
+              <button onClick={fetchApplications}
+                style={{ background: "#f8f9fa", border: "1px solid #ddd", borderRadius: 6, padding: "7px 16px", cursor: "pointer", fontSize: 13 }}>
+                🔄 Refresh
+              </button>
             </div>
 
-            {/* Applications table */}
             <div style={{ background: "white", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", overflow: "hidden" }}>
               {applications.length === 0 ? (
                 <div style={{ padding: 48, textAlign: "center", color: "#aaa" }}>
                   <div style={{ fontSize: 48, marginBottom: 12 }}>📭</div>
-                  <div>No applications yet. Start a job search!</div>
+                  <div>No applications yet. Search and auto-apply!</div>
                 </div>
               ) : (
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ background: "#f8f9fa", borderBottom: "2px solid #dee2e6" }}>
-                      {["Job Title", "Company", "Portal", "Match Score", "Status", "Applied At", "Resume"].map(h => (
-                        <th key={h} style={{ padding: "12px 16px", textAlign: "left", fontSize: 12, fontWeight: 600,
-                                             color: "#555", textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</th>
+                      {["Job Title", "Company", "Portal", "Match", "Status", "Applied", "Resume"].map(h => (
+                        <th key={h} style={{ padding: "12px 16px", textAlign: "left", fontSize: 12,
+                                            fontWeight: 600, color: "#555", textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</th>
                       ))}
                     </tr>
                   </thead>
@@ -339,13 +555,11 @@ export default function App() {
                         <tr key={app.id} style={{ borderBottom: "1px solid #eee", background: i % 2 === 0 ? "white" : "#fafafa" }}>
                           <td style={{ padding: "12px 16px", fontWeight: 500, fontSize: 14 }}>
                             <a href={job.apply_url} target="_blank" rel="noopener noreferrer"
-                               style={{ color: "#2980b9", textDecoration: "none" }}>{job.title || "—"}</a>
+                              style={{ color: "#2980b9", textDecoration: "none" }}>{job.title || "—"}</a>
                           </td>
                           <td style={{ padding: "12px 16px", fontSize: 13, color: "#444" }}>{job.company || "—"}</td>
                           <td style={{ padding: "12px 16px" }}>
-                            <span style={{ background: "#eaf4fb", borderRadius: 20, padding: "2px 10px", fontSize: 12, color: "#2980b9" }}>
-                              {app.portal}
-                            </span>
+                            <span style={{ background: "#eaf4fb", borderRadius: 20, padding: "2px 10px", fontSize: 12, color: "#2980b9" }}>{app.portal}</span>
                           </td>
                           <td style={{ padding: "12px 16px", fontSize: 13 }}>
                             {resume.match_score ? (
@@ -356,9 +570,9 @@ export default function App() {
                           </td>
                           <td style={{ padding: "12px 16px" }}>
                             <span style={{ background: colors.bg, color: colors.text, borderRadius: 20,
-                                           padding: "3px 12px", fontSize: 12, fontWeight: 500 }}>
+                                          padding: "3px 12px", fontSize: 12, fontWeight: 500 }}>
                               <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%",
-                                             background: colors.dot, marginRight: 5 }}/>
+                                            background: colors.dot, marginRight: 5 }} />
                               {app.status}
                             </span>
                           </td>
@@ -366,9 +580,7 @@ export default function App() {
                             {app.applied_at ? new Date(app.applied_at).toLocaleDateString("en-IN") : "—"}
                           </td>
                           <td style={{ padding: "12px 16px" }}>
-                            {resume.pdf_path ? (
-                              <span style={{ fontSize: 12, color: "#28a745" }}>✅ PDF</span>
-                            ) : "—"}
+                            {resume.pdf_path ? <span style={{ fontSize: 12, color: "#28a745" }}>✅ PDF</span> : "—"}
                           </td>
                         </tr>
                       )
@@ -381,5 +593,50 @@ export default function App() {
         )}
       </div>
     </div>
+  )
+}
+
+// ── Job Results Table Component ────────────────────────────────────────────────
+function JobTable({ jobs }) {
+  return (
+    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+      <thead>
+        <tr style={{ borderBottom: "1px solid #eee" }}>
+          {["Job Title", "Company", "Location", "Portal", "Match Score", "Link"].map(h => (
+            <th key={h} style={{ padding: "10px 16px", textAlign: "left", fontSize: 11,
+                                fontWeight: 600, color: "#888", textTransform: "uppercase" }}>{h}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {jobs.map((job, i) => (
+          <tr key={i} style={{ borderBottom: "1px solid #f0f0f0", background: i % 2 === 0 ? "white" : "#fafafa" }}>
+            <td style={{ padding: "11px 16px", fontWeight: 500, fontSize: 13 }}>{job.title}</td>
+            <td style={{ padding: "11px 16px", fontSize: 13, color: "#555" }}>{job.company}</td>
+            <td style={{ padding: "11px 16px", fontSize: 12, color: "#777" }}>{job.location || "—"}</td>
+            <td style={{ padding: "11px 16px" }}>
+              <span style={{ background: "#eaf4fb", borderRadius: 20, padding: "2px 9px", fontSize: 11, color: "#2980b9" }}>{job.portal}</span>
+            </td>
+            <td style={{ padding: "11px 16px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ width: 60, height: 7, background: "#eee", borderRadius: 4, overflow: "hidden" }}>
+                  <div style={{ width: `${job.match_score}%`, height: "100%",
+                               background: job.match_score >= 80 ? "#28a745" : job.match_score >= 60 ? "#ffc107" : "#dc3545",
+                               borderRadius: 4 }} />
+                </div>
+                <span style={{ fontWeight: 600, fontSize: 13,
+                               color: job.match_score >= 80 ? "#28a745" : job.match_score >= 60 ? "#856404" : "#aaa" }}>
+                  {job.match_score}%
+                </span>
+              </div>
+            </td>
+            <td style={{ padding: "11px 16px" }}>
+              <a href={job.apply_url} target="_blank" rel="noopener noreferrer"
+                style={{ color: "#2980b9", fontSize: 12, textDecoration: "none" }}>View →</a>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   )
 }
