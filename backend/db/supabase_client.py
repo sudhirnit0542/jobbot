@@ -21,14 +21,66 @@ async def get_candidate(candidate_id: str) -> dict | None:
         logger.error(f"get_candidate error: {e}")
         return None
 
+
 async def upsert_candidate(data: dict) -> dict:
+    """
+    Upsert candidate. Handles 3 cases:
+    1. New candidate (no id) — insert
+    2. Existing by id — update only provided fields
+    3. Partial update (e.g. CV upload with only id + base_resume_text) — patch only
+    """
     try:
         data["updated_at"] = now_iso()
-        r = supabase.table("candidates").upsert(data).execute()
-        return r.data[0] if r.data else {}
+        candidate_id = data.get("id")
+
+        if candidate_id:
+            # Fetch existing record first
+            existing = await get_candidate(candidate_id)
+            if existing:
+                # Merge — only update fields that are provided and non-null
+                merged = {**existing}
+                for k, v in data.items():
+                    if v is not None and v != "" and v != [] and k != "id":
+                        merged[k] = v
+                merged["id"] = candidate_id
+                merged["updated_at"] = now_iso()
+                r = supabase.table("candidates").update(merged).eq("id", candidate_id).execute()
+                return r.data[0] if r.data else merged
+            else:
+                # Insert with id
+                r = supabase.table("candidates").insert(data).execute()
+                return r.data[0] if r.data else {}
+        else:
+            # No id — check if email exists
+            email = data.get("email", "")
+            if email:
+                existing = await get_candidate_by_email(email)
+                if existing:
+                    # Update existing by id
+                    merged = {**existing}
+                    for k, v in data.items():
+                        if v is not None and v != "" and v != [] and k != "id":
+                            merged[k] = v
+                    merged["updated_at"] = now_iso()
+                    r = supabase.table("candidates").update(merged).eq("id", existing["id"]).execute()
+                    return r.data[0] if r.data else merged
+
+            # Truly new candidate
+            r = supabase.table("candidates").insert(data).execute()
+            return r.data[0] if r.data else {}
+
     except Exception as e:
         logger.error(f"upsert_candidate error: {e}")
         return {}
+
+
+async def get_candidate_by_email(email: str) -> dict | None:
+    try:
+        r = supabase.table("candidates").select("*").eq("email", email).execute()
+        return r.data[0] if r.data else None
+    except Exception as e:
+        logger.error(f"get_candidate_by_email error: {e}")
+        return None
 
 
 # ─── Jobs ─────────────────────────────────────────────────────────────────────

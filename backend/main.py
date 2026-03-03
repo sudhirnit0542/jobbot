@@ -11,12 +11,11 @@ import json
 import io
 
 from config import get_settings
-from agent.graph import run_job_search, run_auto_apply
-from agent.tools.job_search import search_jobs as search_jobs_tool
-from agent.tools.matcher import analyse_jd, match_candidate_to_jd
+from agent.graph import run_auto_apply
 from db.supabase_client import (
-    upsert_candidate, get_candidate,
-    get_applications, create_session, complete_session, save_job
+    upsert_candidate, get_candidate, get_candidate_by_email,
+    get_applications, create_session, complete_session, save_job,
+    supabase, now_iso
 )
 
 settings = get_settings()
@@ -72,16 +71,20 @@ async def health():
 async def save_candidate(profile: CandidateProfile):
     """Save or update candidate profile."""
     data = profile.dict()
+
+    # Build base_resume_text from profile fields
     skills_text = ", ".join(data.get("skills", []))
     exp_text = " | ".join([
         f"{e.get('role', '')} at {e.get('company', '')} ({e.get('duration', '')}): "
         f"{e.get('description', '')} {' '.join(e.get('achievements', []))}"
         for e in data.get("experience", [])
     ])
-    # Only overwrite base_resume_text if no PDF has been uploaded yet
+
+    # Don't overwrite PDF CV if already uploaded
     existing = await get_candidate_by_email(data["email"])
-    if not existing or not existing.get("base_resume_text", "").startswith("PDF:"):
+    if not existing or not (existing.get("base_resume_text") or "").startswith("PDF:"):
         data["base_resume_text"] = f"{data['summary']}\nSkills: {skills_text}\nExperience: {exp_text}"
+
     saved = await upsert_candidate(data)
     return {"success": True, "candidate": saved}
 
@@ -98,10 +101,10 @@ async def get_candidate_profile(candidate_id: str):
 async def upload_cv(candidate_id: str, file: UploadFile = File(...)):
     """
     Upload candidate CV as PDF.
-    Extracts text, skills, and summary using AI.
-    Stores full PDF text as base_resume_text for future job matching.
+    Extracts text and skills using AI.
+    Updates ONLY base_resume_text + skills on the existing candidate record.
     """
-    if not file.filename.endswith(".pdf"):
+    if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files accepted")
 
     candidate = await get_candidate(candidate_id)
@@ -109,40 +112,44 @@ async def upload_cv(candidate_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     try:
-        # Read PDF bytes
         pdf_bytes = await file.read()
-
-        # Extract text from PDF
         pdf_text = extract_pdf_text(pdf_bytes)
 
-        if not pdf_text or len(pdf_text) < 100:
-            raise HTTPException(status_code=400, detail="Could not extract text from PDF. Make sure it's a text-based PDF, not a scanned image.")
+        if not pdf_text or len(pdf_text) < 50:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract text from PDF. Make sure it's a text-based PDF, not a scanned image."
+            )
 
-        # Use AI to extract skills and summary from CV text
+        # Extract skills using AI
         extracted = await extract_skills_from_cv(pdf_text)
 
-        # Save to candidate — prefix with "PDF:" so we know it came from upload
+        # Direct UPDATE — only touch cv-related fields, never touch name/email
         update_data = {
-            "id": candidate_id,
-            "base_resume_text": f"PDF:{pdf_text[:8000]}",  # Store up to 8000 chars
+            "base_resume_text": f"PDF:{pdf_text[:8000]}",
+            "updated_at": now_iso(),
         }
 
-        # Only update skills if we extracted them and candidate has fewer
-        if extracted.get("skills") and len(extracted["skills"]) > len(candidate.get("skills", [])):
-            update_data["skills"] = extracted["skills"]
+        # Only update skills if we extracted more than candidate already has
+        existing_skills = candidate.get("skills") or []
+        new_skills = extracted.get("skills", [])
+        if len(new_skills) > len(existing_skills):
+            update_data["skills"] = new_skills
 
+        # Only update summary if candidate has none
         if extracted.get("summary") and not candidate.get("summary"):
             update_data["summary"] = extracted["summary"]
 
         if extracted.get("experience_years") and not candidate.get("experience_years"):
             update_data["experience_years"] = extracted["experience_years"]
 
-        await upsert_candidate(update_data)
+        # Direct update by ID — no upsert, no insert
+        supabase.table("candidates").update(update_data).eq("id", candidate_id).execute()
 
         return {
             "success": True,
-            "message": "CV uploaded and text extracted",
-            "extracted_skills": extracted.get("skills", []),
+            "message": "CV uploaded and text extracted successfully",
+            "extracted_skills": new_skills,
             "extracted_summary": extracted.get("summary", ""),
             "text_length": len(pdf_text),
         }
@@ -172,44 +179,51 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     except ImportError:
         pass
 
-    raise HTTPException(status_code=500, detail="PDF parsing library not available. Add pdfplumber to requirements.txt")
+    raise HTTPException(
+        status_code=500,
+        detail="PDF parsing library not available. Add pdfplumber to requirements.txt"
+    )
 
 
 async def extract_skills_from_cv(cv_text: str) -> dict:
     """Use AI to extract structured info from CV text."""
     try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        from langchain_groq import ChatGroq
         from langchain_core.messages import HumanMessage
 
-        prompt = f"""Extract structured information from this CV/Resume text.
-Return ONLY a JSON object with these fields:
+        prompt = f"""Extract information from this CV/Resume.
+Return ONLY valid JSON with no markdown, no explanation:
 {{
-  "skills": ["skill1", "skill2", ...],  // all technical skills mentioned
+  "skills": ["skill1", "skill2"],
   "summary": "2-3 sentence professional summary",
-  "experience_years": 5  // total years of experience as integer
+  "experience_years": 5
 }}
 
 CV TEXT:
-{cv_text[:4000]}
+{cv_text[:4000]}"""
 
-Return only the JSON, no other text."""
-
-        # Try Gemini first, then Groq
         llm = None
         if settings.google_api_key:
-            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", google_api_key=settings.google_api_key, temperature=0)
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash-lite",
+                google_api_key=settings.google_api_key,
+                temperature=0
+            )
         elif settings.groq_api_key:
-            llm = ChatGroq(model="llama-3.3-70b-versatile", groq_api_key=settings.groq_api_key, temperature=0)
+            from langchain_groq import ChatGroq
+            llm = ChatGroq(
+                model="llama-3.3-70b-versatile",
+                groq_api_key=settings.groq_api_key,
+                temperature=0
+            )
 
         if llm:
             response = await llm.ainvoke([HumanMessage(content=prompt)])
-            text = response.content.strip()
-            # Strip markdown fences if present
-            text = text.replace("```json", "").replace("```", "").strip()
+            text = response.content.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(text)
+
     except Exception as e:
-        logger.warning(f"AI extraction failed, using fallback: {e}")
+        logger.warning(f"AI extraction failed, using keyword fallback: {e}")
 
     # Fallback — basic keyword extraction
     from agent.tools.matcher import COMMON_TECH_SKILLS
@@ -218,24 +232,14 @@ Return only the JSON, no other text."""
     return {"skills": skills, "summary": "", "experience_years": 0}
 
 
-async def get_candidate_by_email(email: str) -> dict | None:
-    """Helper to find candidate by email."""
-    try:
-        from db.supabase_client import supabase
-        r = supabase.table("candidates").select("*").eq("email", email).execute()
-        return r.data[0] if r.data else None
-    except:
-        return None
-
-
-# ─── Search (Step 1) ──────────────────────────────────────────────────────────
+# ─── Search Jobs (Step 1) ─────────────────────────────────────────────────────
 
 @app.post("/search/jobs")
 async def search_and_score_jobs(req: SearchRequest):
     """
-    Step 1: Search jobs and score each against candidate profile.
-    Returns list of all jobs with match scores — does NOT apply yet.
-    User reviews results then calls /search/apply to trigger auto-apply.
+    Step 1 — Search jobs across all portals and score each against candidate.
+    Returns all jobs with match scores. Does NOT apply yet.
+    User reviews, then calls /search/apply.
     """
     candidate = await get_candidate(req.candidate_id)
     if not candidate:
@@ -248,14 +252,13 @@ async def search_and_score_jobs(req: SearchRequest):
     session_id = session.get("id", "")
 
     try:
-        # Search all portals
-        import json as json_mod
         from agent.tools.job_search import (
             search_adzuna, search_naukri, search_indeed,
             search_instahyre, search_linkedin, fetch_job_description
         )
         from agent.tools.matcher import extract_keywords_from_jd, score_match
 
+        # Search all portals
         all_jobs = []
         all_jobs.extend(search_adzuna(req.job_query, req.location))
         all_jobs.extend(search_naukri(req.job_query, req.location))
@@ -263,7 +266,7 @@ async def search_and_score_jobs(req: SearchRequest):
         all_jobs.extend(search_instahyre(req.job_query, req.location))
         all_jobs.extend(search_linkedin(req.job_query, req.location))
 
-        # Deduplicate
+        # Deduplicate by title + company
         seen = set()
         unique_jobs = []
         for job in all_jobs:
@@ -272,18 +275,16 @@ async def search_and_score_jobs(req: SearchRequest):
                 seen.add(key)
                 unique_jobs.append(job)
 
-        # Score each job against candidate
-        candidate_json_str = json_mod.dumps(candidate)
-        scored_jobs = []
+        logger.info(f"Total unique jobs: {len(unique_jobs)}")
 
-        for job in unique_jobs[:40]:  # Score top 40
+        # Score each job against candidate (top 40)
+        scored_jobs = []
+        for job in unique_jobs[:40]:
             try:
-                # Get JD text — use description if available, else fetch
                 jd_text = job.get("description", "")
                 if len(jd_text) < 200 and job.get("apply_url"):
                     jd_text = fetch_job_description(job["apply_url"], job["portal"])
 
-                # Extract keywords and score
                 kw = extract_keywords_from_jd(jd_text or job.get("title", ""))
                 match = score_match(candidate, kw)
 
@@ -301,11 +302,15 @@ async def search_and_score_jobs(req: SearchRequest):
                 })
             except Exception as e:
                 logger.warning(f"Scoring failed for {job.get('title')}: {e}")
-                scored_jobs.append({**job, "job_id": "", "match_score": 0, "recommendation": "SKIP"})
+                scored_jobs.append({
+                    **job,
+                    "job_id": "",
+                    "match_score": 0,
+                    "recommendation": "SKIP"
+                })
 
-        # Sort by score desc
+        # Sort by score descending
         scored_jobs.sort(key=lambda x: x["match_score"], reverse=True)
-
         matched_count = len([j for j in scored_jobs if j["match_score"] >= 80])
 
         return {
@@ -327,8 +332,7 @@ async def search_and_score_jobs(req: SearchRequest):
 @app.post("/search/apply")
 async def auto_apply_to_jobs(req: ApplyRequest, background_tasks: BackgroundTasks):
     """
-    Step 2: Auto-apply to matched jobs in background.
-    Only applies to job_ids provided (frontend sends ≥80% matched ones).
+    Step 2 — Auto-apply to the matched job IDs in background.
     """
     candidate = await get_candidate(req.candidate_id)
     if not candidate:
@@ -348,7 +352,10 @@ async def auto_apply_to_jobs(req: ApplyRequest, background_tasks: BackgroundTask
             })
         except Exception as e:
             logger.error(f"Auto-apply failed: {e}")
-            await complete_session(req.session_id, {"status": "FAILED", "notes": str(e)})
+            await complete_session(req.session_id, {
+                "status": "FAILED",
+                "notes": str(e)[:500]
+            })
 
     background_tasks.add_task(run_apply)
 
