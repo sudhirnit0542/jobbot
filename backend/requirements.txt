@@ -19,8 +19,8 @@ openai==1.68.2
 # Browser automation
 playwright==1.44.0
 
-# PDF generation
-weasyprint==62.3
+# PDF generation — xhtml2pdf is more reliable than weasyprint on Render
+xhtml2pdf==0.2.16
 
 # PDF parsing (for CV upload)
 pdfplumber==0.11.0

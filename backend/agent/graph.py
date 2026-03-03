@@ -1,6 +1,6 @@
 """
 JobBot LangGraph Agent
-Orchestrates: Search → Analyse → Match → Build Resume → Apply → Save
+Groq primary → Gemini fallback → Groq 8B last resort
 """
 
 from langgraph.graph import StateGraph
@@ -24,30 +24,19 @@ from config import get_settings
 
 settings = get_settings()
 
-# ─── System Prompt ────────────────────────────────────────────────────────────
+APPLY_SYSTEM_PROMPT = """You are JobBot — apply to pre-matched jobs for a candidate.
 
-APPLY_SYSTEM_PROMPT = """You are JobBot — an AI agent applying to pre-matched jobs on behalf of a candidate.
+For each job in the list:
+1. check_already_applied — skip if true
+2. get_portal_credentials — get existing account if any
+3. build_resume — create tailored PDF using candidate profile + JD
+4. apply_to_job — submit application
+5. If new account was created → save_portal_credentials
+6. record_application — log APPLIED or FAILED
+7. save_resume_to_repo — save resume record
 
-You have been given a list of jobs that already passed the 80% match threshold.
-For each job:
-
-1. Use check_already_applied to skip duplicates
-2. Use get_portal_credentials to find existing portal account
-3. Use build_resume to create a tailored PDF resume using the candidate's CV + JD keywords
-4. Use apply_to_job to submit the application
-5. If new account created, use save_portal_credentials to save it
-6. Use record_application to log the result (APPLIED or FAILED)
-7. Use save_resume_to_repo to save the resume record
-
-IMPORTANT:
-- The candidate may have uploaded a PDF CV — use base_resume_text field which contains it
-- Always reference both the CV content and JD keywords when building the resume
-- Report progress clearly: ✅ Applied | ❌ Failed | ⏭ Already applied
-
-Be concise. Report each job result on one line."""
-
-
-# ─── Tools ────────────────────────────────────────────────────────────────────
+IMPORTANT: Always use the full UUID from build_resume result as resume_id.
+Report each job: ✅ Applied | ❌ Failed | ⏭ Already applied"""
 
 ALL_TOOLS = [
     fetch_full_jd,
@@ -65,17 +54,32 @@ ALL_TOOLS = [
 ]
 
 
-# ─── State ────────────────────────────────────────────────────────────────────
-
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
 
 
-# ─── LLM with fallback ────────────────────────────────────────────────────────
-
 def build_llm():
     models = []
 
+    # ── Groq 70B first — higher RPM than Gemini free tier ──
+    if settings.groq_api_key:
+        try:
+            from langchain_groq import ChatGroq
+            models.append({
+                "name": "Groq / llama-3.3-70b-versatile",
+                "llm": ChatGroq(
+                    model="llama-3.3-70b-versatile",
+                    groq_api_key=settings.groq_api_key,
+                    max_tokens=4096,
+                    temperature=0.1,
+                ).bind_tools(ALL_TOOLS),
+                "rate_errors": ["rate_limit_exceeded", "429", "too many requests"],
+            })
+            logger.info("✅ Model loaded: Groq llama-3.3-70b-versatile")
+        except Exception as e:
+            logger.warning(f"Groq 70B unavailable: {e}")
+
+    # ── Gemini second ──
     if settings.google_api_key:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
@@ -87,51 +91,55 @@ def build_llm():
                     temperature=0.1,
                     max_output_tokens=4096,
                 ).bind_tools(ALL_TOOLS),
-                "rate_errors": ["429", "quota", "resource exhausted"],
+                "rate_errors": ["429", "quota", "resource exhausted", "resourceexhausted"],
             })
+            logger.info("✅ Model loaded: Gemini gemini-2.5-flash-lite")
         except Exception as e:
             logger.warning(f"Gemini unavailable: {e}")
 
+    # ── Groq 8B — high rate limits, last resort ──
     if settings.groq_api_key:
         try:
             from langchain_groq import ChatGroq
             models.append({
-                "name": "Groq / llama-3.3-70b",
+                "name": "Groq / llama-3.1-8b-instant",
                 "llm": ChatGroq(
-                    model="llama-3.3-70b-versatile",
+                    model="llama-3.1-8b-instant",
                     groq_api_key=settings.groq_api_key,
                     max_tokens=4096,
                     temperature=0.1,
                 ).bind_tools(ALL_TOOLS),
-                "rate_errors": ["rate_limit_exceeded", "429"],
+                "rate_errors": ["rate_limit_exceeded", "429", "too many requests"],
             })
+            logger.info("✅ Model loaded: Groq llama-3.1-8b-instant")
         except Exception as e:
-            logger.warning(f"Groq unavailable: {e}")
+            logger.warning(f"Groq 8B unavailable: {e}")
 
     if not models:
-        raise RuntimeError("No LLM configured! Set GOOGLE_API_KEY or GROQ_API_KEY")
+        raise RuntimeError("No LLM configured! Set GROQ_API_KEY or GOOGLE_API_KEY")
 
+    logger.info(f"🔗 Fallback chain: {' → '.join(m['name'] for m in models)}")
     return models
 
 
 async def invoke_with_fallback(models, messages):
+    last_error = None
     for i, m in enumerate(models):
         try:
             response = await m["llm"].ainvoke(messages)
             if i > 0:
-                logger.info(f"Fell back to: {m['name']}")
+                logger.info(f"✅ Fell back to: {m['name']}")
             return response
         except Exception as e:
             err = str(e).lower()
             if any(r in err for r in m["rate_errors"]):
-                logger.warning(f"Rate limit on {m['name']}, trying next...")
-                await asyncio.sleep(0.5)
+                logger.warning(f"⚡ Rate limit on {m['name']}, trying next...")
+                last_error = e
+                await asyncio.sleep(1)
                 continue
             raise e
-    raise RuntimeError("All models exhausted")
+    raise RuntimeError(f"All models exhausted. Last error: {last_error}")
 
-
-# ─── Build Graph ──────────────────────────────────────────────────────────────
 
 def build_agent():
     llm_chain = build_llm()
@@ -155,18 +163,13 @@ def build_agent():
 job_agent = build_agent()
 
 
-# ─── Auto Apply (Step 2) ─────────────────────────────────────────────────────
-
 async def run_auto_apply(
     candidate: dict,
     job_ids: list[str],
     session_id: str,
     history: list = None,
 ) -> tuple[str, list]:
-    """
-    Apply to a pre-filtered list of jobs (already scored ≥80%).
-    Fetches each job from DB, builds tailored resume referencing CV, applies.
-    """
+    """Apply to pre-filtered jobs (already scored >=80%)."""
     import json
     from db.supabase_client import supabase
 
@@ -183,33 +186,32 @@ async def run_auto_apply(
             logger.warning(f"Could not fetch job {job_id}: {e}")
 
     if not jobs:
-        return "No valid jobs to apply to.", history
+        return "No valid jobs found to apply to.", history
 
-    # Check if candidate has a PDF CV uploaded
-    has_pdf_cv = candidate.get("base_resume_text", "").startswith("PDF:")
+    has_pdf_cv = (candidate.get("base_resume_text") or "").startswith("PDF:")
 
-    prompt = f"""Apply to these {len(jobs)} pre-matched jobs for the candidate.
+    # Strip base_resume_text from candidate dict shown in prompt (too long)
+    candidate_display = {k: v for k, v in candidate.items() if k != "base_resume_text"}
 
-CANDIDATE PROFILE:
-{json.dumps({k: v for k, v in candidate.items() if k != 'base_resume_text'}, indent=2)}
+    prompt = f"""Apply to these {len(jobs)} pre-matched jobs for this candidate.
 
-{"CANDIDATE HAS UPLOADED A PDF CV — use base_resume_text field when building resumes" if has_pdf_cv else "No PDF CV uploaded — use profile data only"}
+CANDIDATE:
+{json.dumps(candidate_display, indent=2)}
 
-JOBS TO APPLY (all have ≥80% match score already verified):
-{json.dumps([{"id": j.get("id"), "title": j.get("title"), "company": j.get("company"),
-              "portal": j.get("portal"), "apply_url": j.get("apply_url"),
-              "description": (j.get("description") or "")[:500]} for j in jobs], indent=2)}
+{"NOTE: Candidate has uploaded a PDF CV. The full CV text is in candidate base_resume_text field — reference it when building resumes." if has_pdf_cv else "NOTE: No PDF CV. Use profile data only."}
 
-For each job:
-1. check_already_applied first
-2. get_portal_credentials for the portal
-3. build_resume using candidate profile + JD keywords {"+ CV content from base_resume_text" if has_pdf_cv else ""}
-4. apply_to_job
-5. save credentials if new account created
-6. record_application with result
-7. save_resume_to_repo
+JOBS TO APPLY:
+{json.dumps([{
+    "id": j.get("id"),
+    "title": j.get("title"),
+    "company": j.get("company"),
+    "portal": j.get("portal"),
+    "apply_url": j.get("apply_url"),
+    "description": (j.get("description") or "")[:400],
+    "skills_required": j.get("skills_required", []),
+} for j in jobs], indent=2)}
 
-Report each result clearly."""
+Process each job in order. For resume_id always use the full UUID returned by build_resume."""
 
     messages = [HumanMessage(content=prompt)]
     result = await job_agent.ainvoke({"messages": messages})
@@ -222,34 +224,18 @@ Report each result clearly."""
     return response, updated_history
 
 
-# ─── Legacy full search+apply (kept for compatibility) ───────────────────────
-
 async def run_job_search(
     candidate: dict,
     job_query: str,
     location: str = "India",
     history: list = None
 ) -> tuple[str, list]:
-    """Original single-step search+apply flow (kept for backwards compat)."""
+    """Legacy single-step search+apply (kept for compatibility)."""
     import json
-
     history = history or []
-    messages = [HumanMessage(content=m["content"]) if m["role"] == "user"
-                else AIMessage(content=m["content"])
-                for m in history]
-
-    prompt = f"""Search and apply for {job_query} jobs in {location} for this candidate.
-Only apply to jobs with match score >= {settings.min_match_score}%.
-
-CANDIDATE:
-{json.dumps(candidate, indent=2)}"""
-
-    messages.append(HumanMessage(content=prompt))
+    prompt = f"Search and apply for {job_query} jobs in {location} for candidate: {json.dumps(candidate, indent=2)}"
+    messages = [HumanMessage(content=prompt)]
     result = await job_agent.ainvoke({"messages": messages})
     response = result["messages"][-1].content
-
-    updated_history = history + [
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": response}
-    ]
+    updated_history = history + [{"role": "user", "content": prompt}, {"role": "assistant", "content": response}]
     return response, updated_history
