@@ -3,14 +3,7 @@ import { createClient } from "@supabase/supabase-js"
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || ""
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || ""
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: {
-    flowType: "implicit",
-    detectSessionInUrl: true,
-    persistSession: true,
-    autoRefreshToken: true,
-  }
-})
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000"
 
@@ -56,48 +49,24 @@ export default function App() {
     experience: [], education: [], certifications: []
   })
 
-  // ── Auth: listen for login/logout ──
+  // ── Auth ──
   useEffect(() => {
-    // Step 1: register listener first
+    // onAuthStateChange fires on: initial load, OAuth redirect, login, logout
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (session) {
+      if (session?.user) {
         setUser(session.user)
         setAuthToken(session.access_token)
-        if (window.location.hash.includes("access_token")) {
-          window.history.replaceState({}, document.title, window.location.pathname)
+        // Clean hash from URL after OAuth redirect
+        if (window.location.hash) {
+          window.history.replaceState(null, "", window.location.pathname)
         }
-      } else if (event === "SIGNED_OUT") {
+      } else {
         setUser(null)
         setAuthToken("")
         setCandidateId("")
         setCandidate(null)
       }
     })
-
-    // Step 2: manually handle OAuth hash redirect
-    // Supabase v2 with ES module bundlers sometimes misses the hash
-    const hash = window.location.hash
-    if (hash && hash.includes("access_token")) {
-      const params = new URLSearchParams(hash.replace("#", ""))
-      const accessToken  = params.get("access_token")
-      const refreshToken = params.get("refresh_token")
-      if (accessToken && refreshToken) {
-        supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken })
-          .then(({ data, error }) => {
-            if (error) console.error("setSession error:", error)
-            // onAuthStateChange will fire SIGNED_IN and update state
-          })
-      }
-    } else {
-      // Normal page load — restore existing session
-      supabase.auth.getSession().then(({ data: { session } }) => {
-        if (session) {
-          setUser(session.user)
-          setAuthToken(session.access_token)
-        }
-      })
-    }
-
     return () => subscription.unsubscribe()
   }, [])
 
@@ -294,14 +263,15 @@ export default function App() {
 
   const handleGoogleLogin = async () => {
     setAuthError("")
-    const redirectTo = window.location.origin + window.location.pathname
+    setAuthLoading(true)
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: {
-        redirectTo,
-        queryParams: { access_type: "offline", prompt: "consent" }
+        redirectTo: window.location.origin,
+        skipBrowserRedirect: false,
       }
     })
+    setAuthLoading(false)
     if (error) setAuthError(error.message)
   }
 
