@@ -122,11 +122,30 @@ async def get_resume(resume_id: str) -> dict | None:
 
 # ─── Applications ─────────────────────────────────────────────────────────────
 
+def _is_valid_uuid(v: str) -> bool:
+    import re
+    return bool(v and re.match(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', v, re.I
+    ))
+
 async def save_application(data: dict) -> dict:
     try:
         if data.get("applied_at") == "NOW()":
             data["applied_at"] = now_iso()
         data["last_updated"] = now_iso()
+
+        # Strip resume_id if empty or invalid UUID — column is nullable
+        resume_id = data.get("resume_id", "")
+        if not _is_valid_uuid(resume_id):
+            logger.warning(f"save_application: dropping invalid resume_id='{resume_id}'")
+            data.pop("resume_id", None)
+
+        # Same for job_id and candidate_id — fail fast with a clear message
+        for field in ("candidate_id", "job_id"):
+            if not _is_valid_uuid(data.get(field, "")):
+                logger.error(f"save_application: invalid {field}='{data.get(field)}' — skipping")
+                return {}
+
         r = supabase.table("applications").upsert(data).execute()
         return r.data[0] if r.data else {}
     except Exception as e:

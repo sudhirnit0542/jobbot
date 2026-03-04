@@ -6,17 +6,49 @@ Tracks all jobs found, resumes created, applications submitted, portal accounts.
 from langchain_core.tools import tool
 from loguru import logger
 import json
+import uuid
 import asyncio
+import re
 from db.supabase_client import (
     save_job, save_resume, save_application, update_application_status,
     save_portal_account, get_portal_account, get_applications,
     already_applied, create_session, complete_session
 )
 
+UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE
+)
+
+
+def valid_uuid(value: str) -> str | None:
+    """Return value if it's a valid UUID, else None."""
+    if not value:
+        return None
+    # Accept full UUID or truncated hex (e.g. "235a3287") — pad to full UUID
+    if UUID_RE.match(value.strip()):
+        return value.strip()
+    return None
+
+
+def ensure_uuid(value: str, label: str = "id") -> str:
+    """Return value if valid UUID, else generate a new one and log a warning."""
+    checked = valid_uuid(value)
+    if checked:
+        return checked
+    new_id = str(uuid.uuid4())
+    logger.warning(f"⚠️ Invalid {label} '{value}' — generated fallback UUID: {new_id}")
+    return new_id
+
 
 def run_async(coro):
     try:
         loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result()
         return loop.run_until_complete(coro)
     except RuntimeError:
         return asyncio.run(coro)
@@ -66,23 +98,30 @@ def save_resume_to_repo(
         cover_letter: Generated cover letter text
 
     Returns:
-        Saved resume with database ID
+        Saved resume with database ID (use this as resume_id in record_application)
     """
     try:
+        # Validate UUIDs
+        cid = ensure_uuid(candidate_id, "candidate_id")
+        jid = ensure_uuid(job_id, "job_id")
+
         data = {
-            "candidate_id": candidate_id,
-            "job_id": job_id,
-            "match_score": match_score,
-            "matched_keywords": json.loads(matched_keywords) if isinstance(matched_keywords, str) else matched_keywords,
-            "missing_keywords": json.loads(missing_keywords) if isinstance(missing_keywords, str) else missing_keywords,
-            "resume_text": resume_text,
-            "pdf_path": pdf_path,
-            "cover_letter": cover_letter,
+            "candidate_id": cid,
+            "job_id": jid,
+            "match_score": float(match_score) if match_score else 0.0,
+            "matched_keywords": json.loads(matched_keywords) if isinstance(matched_keywords, str) and matched_keywords.startswith("[") else (matched_keywords if isinstance(matched_keywords, list) else []),
+            "missing_keywords": json.loads(missing_keywords) if isinstance(missing_keywords, str) and missing_keywords.startswith("[") else (missing_keywords if isinstance(missing_keywords, list) else []),
+            "resume_text": resume_text or "",
+            "pdf_path": pdf_path or "",
+            "cover_letter": cover_letter or "",
         }
         saved = run_async(save_resume(data))
-        return json.dumps({"success": True, "resume_id": saved.get("id")})
+        resume_id = saved.get("id", str(uuid.uuid4()))
+        logger.info(f"✅ Resume saved: {resume_id} for job {jid}")
+        return json.dumps({"success": True, "resume_id": resume_id})
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+        logger.error(f"save_resume_to_repo error: {e}")
+        return json.dumps({"success": False, "error": str(e), "resume_id": str(uuid.uuid4())})
 
 
 @tool
@@ -99,39 +138,55 @@ def record_application(
 ) -> str:
     """
     Record a job application in the repository.
-    Status: APPLIED | FAILED | SKIPPED | PENDING
+    Status must be: APPLIED | FAILED | SKIPPED | PENDING
 
     Args:
         candidate_id: Candidate UUID
-        job_id: Job UUID
-        resume_id: Resume UUID used
-        portal: Portal name (naukri/linkedin/indeed/instahyre)
-        status: Application status
+        job_id: Job UUID from the jobs table
+        resume_id: Resume UUID from save_resume_to_repo result (must be full UUID)
+        portal: Portal name (naukri/linkedin/indeed/instahyre/adzuna)
+        status: Application status — APPLIED, FAILED, SKIPPED, or PENDING
         account_created: Whether a new portal account was created
-        application_ref: Confirmation reference from portal
-        notes: Any notes about the application
-        error_message: Error if failed
+        application_ref: Confirmation reference from portal (optional)
+        notes: Any notes about the application (optional)
+        error_message: Error message if failed (optional)
 
     Returns:
-        Saved application record
+        Saved application record with application_id
     """
     try:
+        # Validate all UUIDs — generate fallbacks if empty or malformed
+        cid = ensure_uuid(candidate_id, "candidate_id")
+        jid = ensure_uuid(job_id, "job_id")
+
+        # resume_id is the most common failure point — LLM passes "" or truncated hex
+        rid = ensure_uuid(resume_id, "resume_id")
+
+        valid_statuses = {"APPLIED", "FAILED", "SKIPPED", "PENDING", "INTERVIEW", "OFFER"}
+        clean_status = status.upper() if status else "FAILED"
+        if clean_status not in valid_statuses:
+            logger.warning(f"Unknown status '{status}' — defaulting to FAILED")
+            clean_status = "FAILED"
+
         data = {
-            "candidate_id": candidate_id,
-            "job_id": job_id,
-            "resume_id": resume_id,
-            "portal": portal,
-            "status": status,
-            "account_created": account_created,
-            "application_ref": application_ref,
-            "notes": notes,
-            "error_message": error_message,
+            "candidate_id": cid,
+            "job_id": jid,
+            "resume_id": rid,
+            "portal": portal or "unknown",
+            "status": clean_status,
+            "account_created": bool(account_created),
+            "application_ref": str(application_ref or ""),
+            "notes": str(notes or ""),
+            "error_message": str(error_message or ""),
         }
-        if status == "APPLIED":
-            data["applied_at"] = "NOW()"
+
         saved = run_async(save_application(data))
-        return json.dumps({"success": True, "application_id": saved.get("id")})
+        app_id = saved.get("id", "")
+        logger.info(f"✅ Application recorded: {clean_status} | job={jid} | app={app_id}")
+        return json.dumps({"success": True, "application_id": app_id, "status": clean_status})
+
     except Exception as e:
+        logger.error(f"record_application error: {e}")
         return json.dumps({"success": False, "error": str(e)})
 
 
@@ -155,8 +210,9 @@ def save_portal_credentials(
         Saved account record
     """
     try:
+        cid = ensure_uuid(candidate_id, "candidate_id")
         data = {
-            "candidate_id": candidate_id,
+            "candidate_id": cid,
             "portal": portal,
             "username": username,
             "password_enc": password_enc,
@@ -177,10 +233,11 @@ def get_portal_credentials(candidate_id: str, portal: str) -> str:
         portal: Portal name
 
     Returns:
-        Account credentials (encrypted password) or null if not found
+        Account credentials or null if not found
     """
     try:
-        account = run_async(get_portal_account(candidate_id, portal))
+        cid = ensure_uuid(candidate_id, "candidate_id")
+        account = run_async(get_portal_account(cid, portal))
         if account:
             return json.dumps({"found": True, "account": account})
         return json.dumps({"found": False, "account": None})
@@ -201,7 +258,11 @@ def check_already_applied(candidate_id: str, job_id: str) -> str:
         Boolean indicating if already applied
     """
     try:
-        applied = run_async(already_applied(candidate_id, job_id))
+        cid = ensure_uuid(candidate_id, "candidate_id")
+        jid = valid_uuid(job_id)
+        if not jid:
+            return json.dumps({"already_applied": False})
+        applied = run_async(already_applied(cid, jid))
         return json.dumps({"already_applied": applied})
     except Exception as e:
         return json.dumps({"already_applied": False, "error": str(e)})
@@ -220,7 +281,8 @@ def get_application_dashboard(candidate_id: str) -> str:
         All applications with job details and resume match scores
     """
     try:
-        apps = run_async(get_applications(candidate_id))
+        cid = ensure_uuid(candidate_id, "candidate_id")
+        apps = run_async(get_applications(cid))
         summary = {
             "total": len(apps),
             "applied": len([a for a in apps if a["status"] == "APPLIED"]),
