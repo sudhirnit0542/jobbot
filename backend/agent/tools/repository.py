@@ -159,19 +159,43 @@ def record_application(
         cid = ensure_uuid(candidate_id, "candidate_id")
         jid = ensure_uuid(job_id, "job_id")
 
-        # resume_id is the most common failure point — LLM passes "" or truncated hex
-        rid = ensure_uuid(resume_id, "resume_id")
-
         valid_statuses = {"APPLIED", "FAILED", "SKIPPED", "PENDING", "INTERVIEW", "OFFER"}
         clean_status = status.upper() if status else "FAILED"
         if clean_status not in valid_statuses:
             logger.warning(f"Unknown status '{status}' — defaulting to FAILED")
             clean_status = "FAILED"
 
+        # Verify resume exists in DB before using as FK — if not, save a placeholder
+        rid = valid_uuid(resume_id)
+        if rid:
+            from db.supabase_client import supabase as _supa
+            try:
+                check = _supa.table("resumes").select("id").eq("id", rid).execute()
+                if not check.data:
+                    logger.warning(f"resume_id {rid} not in DB yet — saving placeholder resume")
+                    placeholder = run_async(save_resume({
+                        "id": rid,
+                        "candidate_id": cid,
+                        "job_id": jid,
+                        "match_score": 0,
+                        "pdf_path": "",
+                        "resume_text": "",
+                        "cover_letter": "",
+                        "matched_keywords": [],
+                        "missing_keywords": [],
+                    }))
+                    if not placeholder.get("id"):
+                        rid = None  # Give up on resume_id, save without it
+            except Exception as e:
+                logger.warning(f"Could not verify resume_id: {e}")
+                rid = None
+        else:
+            logger.warning(f"Invalid resume_id '{resume_id}' — saving application without it")
+            rid = None
+
         data = {
             "candidate_id": cid,
             "job_id": jid,
-            "resume_id": rid,
             "portal": portal or "unknown",
             "status": clean_status,
             "account_created": bool(account_created),
@@ -179,6 +203,8 @@ def record_application(
             "notes": str(notes or ""),
             "error_message": str(error_message or ""),
         }
+        if rid:
+            data["resume_id"] = rid
 
         saved = run_async(save_application(data))
         app_id = saved.get("id", "")

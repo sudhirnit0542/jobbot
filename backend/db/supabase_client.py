@@ -140,14 +140,24 @@ async def save_application(data: dict) -> dict:
             logger.warning(f"save_application: dropping invalid resume_id='{resume_id}'")
             data.pop("resume_id", None)
 
-        # Same for job_id and candidate_id — fail fast with a clear message
+        # Validate required UUID fields
         for field in ("candidate_id", "job_id"):
             if not _is_valid_uuid(data.get(field, "")):
                 logger.error(f"save_application: invalid {field}='{data.get(field)}' — skipping")
                 return {}
 
-        r = supabase.table("applications").upsert(data).execute()
-        return r.data[0] if r.data else {}
+        try:
+            r = supabase.table("applications").upsert(data).execute()
+            return r.data[0] if r.data else {}
+        except Exception as e:
+            err = str(e)
+            # FK violation — resume not saved yet, retry without resume_id
+            if "23503" in err and "resume_id" in err:
+                logger.warning("save_application: resume FK violation — retrying without resume_id")
+                data.pop("resume_id", None)
+                r = supabase.table("applications").upsert(data).execute()
+                return r.data[0] if r.data else {}
+            raise e
     except Exception as e:
         logger.error(f"save_application error: {e}")
         return {}
