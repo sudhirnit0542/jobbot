@@ -139,6 +139,25 @@ class ApplyRequest(BaseModel):
     job_ids: list[str] = []
 
 
+# ─── Startup: ensure Playwright chromium is installed ────────────────────────
+
+@app.on_event("startup")
+async def install_playwright():
+    """Install Playwright chromium on startup if missing — handles Render restarts."""
+    import subprocess, shutil
+    try:
+        result = subprocess.run(
+            ["playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            logger.info("✅ Playwright chromium ready")
+        else:
+            logger.warning(f"Playwright install warning: {result.stderr[:200]}")
+    except Exception as e:
+        logger.error(f"Playwright install failed: {e}")
+
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")

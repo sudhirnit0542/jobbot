@@ -20,6 +20,13 @@ import secrets
 import string
 import base64
 import re
+import os
+
+# Ensure Playwright finds its browser on Render
+# PLAYWRIGHT_BROWSERS_PATH is set in render.yaml env vars
+# This also handles local dev where the default path is used
+if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.environ["PLAYWRIGHT_BROWSERS_PATH"]
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
