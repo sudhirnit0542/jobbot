@@ -41,17 +41,6 @@ def ensure_uuid(value: str, label: str = "id") -> str:
     return new_id
 
 
-def run_async(coro):
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
 
 
 @tool
@@ -67,7 +56,7 @@ def save_job_to_repo(job_json: str) -> str:
     """
     try:
         job = json.loads(job_json) if isinstance(job_json, str) else job_json
-        saved = run_async(save_job(job))
+        saved = save_job(job)
         return json.dumps({"success": True, "job_id": saved.get("id"), "job": saved})
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})
@@ -115,7 +104,7 @@ def save_resume_to_repo(
             "pdf_path": pdf_path or "",
             "cover_letter": cover_letter or "",
         }
-        saved = run_async(save_resume(data))
+        saved = save_resume(data)
         resume_id = saved.get("id", str(uuid.uuid4()))
         logger.info(f"✅ Resume saved: {resume_id} for job {jid}")
         return json.dumps({"success": True, "resume_id": resume_id})
@@ -173,7 +162,7 @@ def record_application(
                 check = _supa.table("resumes").select("id").eq("id", rid).execute()
                 if not check.data:
                     logger.warning(f"resume_id {rid} not in DB yet — saving placeholder resume")
-                    placeholder = run_async(save_resume({
+                    placeholder = save_resume({
                         "id": rid,
                         "candidate_id": cid,
                         "job_id": jid,
@@ -183,7 +172,7 @@ def record_application(
                         "cover_letter": "",
                         "matched_keywords": [],
                         "missing_keywords": [],
-                    }))
+                    })
                     if not placeholder.get("id"):
                         rid = None  # Give up on resume_id, save without it
             except Exception as e:
@@ -206,7 +195,7 @@ def record_application(
         if rid:
             data["resume_id"] = rid
 
-        saved = run_async(save_application(data))
+        saved = save_application(data)
         app_id = saved.get("id", "")
         logger.info(f"✅ Application recorded: {clean_status} | job={jid} | app={app_id}")
         return json.dumps({"success": True, "application_id": app_id, "status": clean_status})
@@ -243,7 +232,7 @@ def save_portal_credentials(
             "username": username,
             "password_enc": password_enc,
         }
-        saved = run_async(save_portal_account(data))
+        saved = save_portal_account(data)
         return json.dumps({"success": True, "account_id": saved.get("id")})
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})
@@ -263,7 +252,7 @@ def get_portal_credentials(candidate_id: str, portal: str) -> str:
     """
     try:
         cid = ensure_uuid(candidate_id, "candidate_id")
-        account = run_async(get_portal_account(cid, portal))
+        account = get_portal_account(cid, portal)
         if account:
             return json.dumps({"found": True, "account": account})
         return json.dumps({"found": False, "account": None})
@@ -288,7 +277,7 @@ def check_already_applied(candidate_id: str, job_id: str) -> str:
         jid = valid_uuid(job_id)
         if not jid:
             return json.dumps({"already_applied": False})
-        applied = run_async(already_applied(cid, jid))
+        applied = already_applied(cid, jid)
         return json.dumps({"already_applied": applied})
     except Exception as e:
         return json.dumps({"already_applied": False, "error": str(e)})
@@ -308,7 +297,7 @@ def get_application_dashboard(candidate_id: str) -> str:
     """
     try:
         cid = ensure_uuid(candidate_id, "candidate_id")
-        apps = run_async(get_applications(cid))
+        apps = get_applications(cid)
         summary = {
             "total": len(apps),
             "applied": len([a for a in apps if a["status"] == "APPLIED"]),

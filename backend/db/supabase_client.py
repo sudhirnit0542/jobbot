@@ -13,7 +13,7 @@ def now_iso() -> str:
 
 # ─── Candidates ───────────────────────────────────────────────────────────────
 
-async def get_candidate(candidate_id: str) -> dict | None:
+def get_candidate(candidate_id: str) -> dict | None:
     try:
         r = supabase.table("candidates").select("*").eq("id", candidate_id).single().execute()
         return r.data
@@ -22,7 +22,7 @@ async def get_candidate(candidate_id: str) -> dict | None:
         return None
 
 
-async def upsert_candidate(data: dict) -> dict:
+def upsert_candidate(data: dict) -> dict:
     """
     Upsert candidate. Handles 3 cases:
     1. New candidate (no id) — insert
@@ -35,7 +35,7 @@ async def upsert_candidate(data: dict) -> dict:
 
         if candidate_id:
             # Fetch existing record first
-            existing = await get_candidate(candidate_id)
+            existing = get_candidate(candidate_id)
             if existing:
                 # Merge — only update fields that are provided and non-null
                 merged = {**existing}
@@ -54,7 +54,7 @@ async def upsert_candidate(data: dict) -> dict:
             # No id — check if email exists
             email = data.get("email", "")
             if email:
-                existing = await get_candidate_by_email(email)
+                existing = get_candidate_by_email(email)
                 if existing:
                     # Update existing by id
                     merged = {**existing}
@@ -74,7 +74,7 @@ async def upsert_candidate(data: dict) -> dict:
         return {}
 
 
-async def get_candidate_by_email(email: str) -> dict | None:
+def get_candidate_by_email(email: str) -> dict | None:
     try:
         r = supabase.table("candidates").select("*").eq("email", email).execute()
         return r.data[0] if r.data else None
@@ -85,7 +85,7 @@ async def get_candidate_by_email(email: str) -> dict | None:
 
 # ─── Jobs ─────────────────────────────────────────────────────────────────────
 
-async def save_job(data: dict) -> dict:
+def save_job(data: dict) -> dict:
     try:
         r = supabase.table("jobs").upsert(data, on_conflict="portal,external_id").execute()
         return r.data[0] if r.data else {}
@@ -93,7 +93,7 @@ async def save_job(data: dict) -> dict:
         logger.error(f"save_job error: {e}")
         return {}
 
-async def get_jobs(candidate_id: str) -> list:
+def get_jobs(candidate_id: str) -> list:
     try:
         r = supabase.table("jobs").select("*").eq("is_active", True).execute()
         return r.data or []
@@ -104,7 +104,7 @@ async def get_jobs(candidate_id: str) -> list:
 
 # ─── Resumes ──────────────────────────────────────────────────────────────────
 
-async def save_resume(data: dict) -> dict:
+def save_resume(data: dict) -> dict:
     try:
         r = supabase.table("resumes").insert(data).execute()
         return r.data[0] if r.data else {}
@@ -112,7 +112,7 @@ async def save_resume(data: dict) -> dict:
         logger.error(f"save_resume error: {e}")
         return {}
 
-async def get_resume(resume_id: str) -> dict | None:
+def get_resume(resume_id: str) -> dict | None:
     try:
         r = supabase.table("resumes").select("*").eq("id", resume_id).single().execute()
         return r.data
@@ -128,7 +128,7 @@ def _is_valid_uuid(v: str) -> bool:
         r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', v, re.I
     ))
 
-async def save_application(data: dict) -> dict:
+def save_application(data: dict) -> dict:
     try:
         if data.get("applied_at") == "NOW()":
             data["applied_at"] = now_iso()
@@ -172,7 +172,7 @@ async def save_application(data: dict) -> dict:
         logger.error(f"save_application error: {e}")
         return {}
 
-async def update_application_status(app_id: str, status: str, notes: str = None, error: str = None):
+def update_application_status(app_id: str, status: str, notes: str = None, error: str = None):
     try:
         data = {"status": status, "last_updated": now_iso()}
         if notes:
@@ -185,7 +185,7 @@ async def update_application_status(app_id: str, status: str, notes: str = None,
     except Exception as e:
         logger.error(f"update_application_status error: {e}")
 
-async def get_applications(candidate_id: str) -> list:
+def get_applications(candidate_id: str) -> list:
     try:
         r = supabase.table("applications").select(
             "*, jobs(title, company, portal, apply_url), resumes(id, match_score, pdf_path)"
@@ -195,7 +195,7 @@ async def get_applications(candidate_id: str) -> list:
         logger.error(f"get_applications error: {e}")
         return []
 
-async def already_applied(candidate_id: str, job_id: str) -> bool:
+def already_applied(candidate_id: str, job_id: str) -> bool:
     try:
         r = supabase.table("applications").select("id").eq(
             "candidate_id", candidate_id
@@ -207,7 +207,7 @@ async def already_applied(candidate_id: str, job_id: str) -> bool:
 
 # ─── Portal Accounts ──────────────────────────────────────────────────────────
 
-async def save_portal_account(data: dict) -> dict:
+def save_portal_account(data: dict) -> dict:
     try:
         r = supabase.table("portal_accounts").upsert(
             data, on_conflict="candidate_id,portal"
@@ -217,7 +217,7 @@ async def save_portal_account(data: dict) -> dict:
         logger.error(f"save_portal_account error: {e}")
         return {}
 
-async def get_portal_account(candidate_id: str, portal: str) -> dict | None:
+def get_portal_account(candidate_id: str, portal: str) -> dict | None:
     try:
         r = supabase.table("portal_accounts").select("*").eq(
             "candidate_id", candidate_id
@@ -229,7 +229,7 @@ async def get_portal_account(candidate_id: str, portal: str) -> dict | None:
 
 # ─── Search Sessions ──────────────────────────────────────────────────────────
 
-async def create_session(candidate_id: str, query: str, portals: list) -> dict:
+def create_session(candidate_id: str, query: str, portals: list) -> dict:
     try:
         r = supabase.table("search_sessions").insert({
             "candidate_id": candidate_id,
@@ -243,13 +243,13 @@ async def create_session(candidate_id: str, query: str, portals: list) -> dict:
         logger.error(f"create_session error: {e}")
         return {}
 
-async def update_session(session_id: str, data: dict) -> None:
+def update_session(session_id: str, data: dict) -> None:
     try:
         supabase.table("search_sessions").update(data).eq("id", session_id).execute()
     except Exception as e:
         logger.error(f"update_session error: {e}")
 
-async def complete_session(session_id: str, stats: dict) -> None:
+def complete_session(session_id: str, stats: dict) -> None:
     try:
         update_data = {k: v for k, v in stats.items() if v != "NOW()"}
         update_data["completed_at"] = now_iso()

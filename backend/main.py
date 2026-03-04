@@ -81,17 +81,17 @@ async def save_candidate(profile: CandidateProfile):
     ])
 
     # Don't overwrite PDF CV if already uploaded
-    existing = await get_candidate_by_email(data["email"])
+    existing = get_candidate_by_email(data["email"])
     if not existing or not (existing.get("base_resume_text") or "").startswith("PDF:"):
         data["base_resume_text"] = f"{data['summary']}\nSkills: {skills_text}\nExperience: {exp_text}"
 
-    saved = await upsert_candidate(data)
+    saved = upsert_candidate(data)
     return {"success": True, "candidate": saved}
 
 
 @app.get("/candidate/{candidate_id}")
 async def get_candidate_profile(candidate_id: str):
-    candidate = await get_candidate(candidate_id)
+    candidate = get_candidate(candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     return candidate
@@ -107,7 +107,7 @@ async def upload_cv(candidate_id: str, file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files accepted")
 
-    candidate = await get_candidate(candidate_id)
+    candidate = get_candidate(candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
@@ -241,11 +241,11 @@ async def search_and_score_jobs(req: SearchRequest):
     Returns all jobs with match scores. Does NOT apply yet.
     User reviews, then calls /search/apply.
     """
-    candidate = await get_candidate(req.candidate_id)
+    candidate = get_candidate(req.candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    session = await create_session(
+    session = create_session(
         req.candidate_id, req.job_query,
         ["naukri", "linkedin", "indeed", "instahyre", "adzuna"]
     )
@@ -289,7 +289,7 @@ async def search_and_score_jobs(req: SearchRequest):
                 match = score_match(candidate, kw)
 
                 # Save job to DB
-                saved = await save_job(job)
+                saved = save_job(job)
                 job_id = saved.get("id", "")
 
                 scored_jobs.append({
@@ -334,7 +334,7 @@ async def auto_apply_to_jobs(req: ApplyRequest, background_tasks: BackgroundTask
     """
     Step 2 — Auto-apply to the matched job IDs in background.
     """
-    candidate = await get_candidate(req.candidate_id)
+    candidate = get_candidate(req.candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
@@ -345,14 +345,14 @@ async def auto_apply_to_jobs(req: ApplyRequest, background_tasks: BackgroundTask
                 job_ids=req.job_ids,
                 session_id=req.session_id,
             )
-            await complete_session(req.session_id, {
+            complete_session(req.session_id, {
                 "status": "COMPLETED",
                 "jobs_applied": len(req.job_ids),
                 "notes": response[:500]
             })
         except Exception as e:
             logger.error(f"Auto-apply failed: {e}")
-            await complete_session(req.session_id, {
+            complete_session(req.session_id, {
                 "status": "FAILED",
                 "notes": str(e)[:500]
             })
@@ -371,7 +371,7 @@ async def auto_apply_to_jobs(req: ApplyRequest, background_tasks: BackgroundTask
 
 @app.get("/applications/{candidate_id}")
 async def get_candidate_applications(candidate_id: str):
-    apps = await get_applications(candidate_id)
+    apps = get_applications(candidate_id)
     summary = {
         "total": len(apps),
         "applied": len([a for a in apps if a["status"] == "APPLIED"]),
@@ -392,7 +392,7 @@ async def download_resume(resume_id: str):
     from db.supabase_client import get_resume
     import os
 
-    resume = await get_resume(resume_id)
+    resume = get_resume(resume_id)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -419,7 +419,7 @@ async def view_resume(resume_id: str):
     from db.supabase_client import get_resume
     import os
 
-    resume = await get_resume(resume_id)
+    resume = get_resume(resume_id)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 

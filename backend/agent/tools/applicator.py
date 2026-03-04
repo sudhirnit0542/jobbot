@@ -566,12 +566,7 @@ def apply_to_job(
             return {"success": False, "status": "FAILED", "error": f"Unhandled exception: {str(e)[:400]}"}
 
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, _apply())
-                return json.dumps(future.result())
-        return json.dumps(loop.run_until_complete(_apply()))
+        return json.dumps(asyncio.run(_apply()))
     except Exception as e:
+        logger.error(f"apply_to_job outer error: {e}")
         return json.dumps({"success": False, "status": "FAILED", "error": str(e)})
