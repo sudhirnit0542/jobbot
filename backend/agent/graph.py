@@ -1,6 +1,6 @@
 """
 JobBot LangGraph Agent
-Groq primary → Gemini fallback → Groq 8B last resort
+Fallback chain: Groq 70B → Gemini → Zhipu GLM → Groq 8B
 """
 
 from langgraph.graph import StateGraph
@@ -58,10 +58,69 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
 
 
-def build_llm():
+def is_rate_limit_error(error: Exception, rate_limit_errors: list[str]) -> bool:
+    """Check if error is a rate limit or decommissioned model error."""
+    error_str = str(error).lower()
+    if "decommissioned" in error_str or "no longer supported" in error_str:
+        return True
+    return any(indicator.lower() in error_str for indicator in rate_limit_errors)
+
+
+# ─── FallbackLLM — same pattern as BrokerBot ─────────────────────────────────
+
+class FallbackLLM:
+    """
+    Wraps multiple LLMs with automatic fallback on rate limit errors.
+    Tries models in order — if one hits rate limit, moves to next.
+    """
+
+    def __init__(self, model_chain: list[dict], tools: list):
+        self.bound_models = []
+        for entry in model_chain:
+            try:
+                bound = entry["llm"].bind_tools(tools)
+                self.bound_models.append({
+                    "name": entry["name"],
+                    "llm": bound,
+                    "rate_limit_errors": entry["rate_limit_errors"],
+                })
+            except Exception as e:
+                logger.warning(f"Could not bind tools to {entry['name']}: {e}")
+
+    async def ainvoke(self, messages: list) -> BaseMessage:
+        last_error = None
+        for i, model_entry in enumerate(self.bound_models):
+            try:
+                logger.info(f"🤖 Trying model: {model_entry['name']}")
+                response = await model_entry["llm"].ainvoke(messages)
+                if i > 0:
+                    logger.info(f"✅ Fell back to: {model_entry['name']}")
+                return response
+            except Exception as e:
+                if is_rate_limit_error(e, model_entry["rate_limit_errors"]):
+                    logger.warning(f"⚡ Skipping {model_entry['name']} (rate limit) — trying next...")
+                    last_error = e
+                    await asyncio.sleep(0.5)
+                    continue
+                else:
+                    logger.error(f"❌ Error on {model_entry['name']}: {e}")
+                    raise e
+        raise RuntimeError(f"All models exhausted. Last error: {last_error}")
+
+
+# ─── Build Model Chain ────────────────────────────────────────────────────────
+
+def build_model_chain() -> list[dict]:
+    """
+    Build fallback chain in priority order:
+    1. Groq Llama 3.3 70B  — best tool use, free, high RPM
+    2. Gemini 2.5 Flash     — free but only 10 RPM on free tier
+    3. Zhipu GLM-4-Flash    — free, generous limits, via OpenAI-compatible API
+    4. Groq Llama 3.1 8B   — very high RPM, last resort
+    """
     models = []
 
-    # ── Groq 70B first — higher RPM than Gemini free tier ──
+    # ── 1. Groq Llama 3.3 70B (primary — best tool use) ──
     if settings.groq_api_key:
         try:
             from langchain_groq import ChatGroq
@@ -72,32 +131,51 @@ def build_llm():
                     groq_api_key=settings.groq_api_key,
                     max_tokens=4096,
                     temperature=0.1,
-                ).bind_tools(ALL_TOOLS),
-                "rate_errors": ["rate_limit_exceeded", "429", "too many requests"],
+                ),
+                "rate_limit_errors": ["rate_limit_exceeded", "429", "RateLimitError", "Too Many Requests"],
             })
             logger.info("✅ Model loaded: Groq llama-3.3-70b-versatile")
         except Exception as e:
-            logger.warning(f"Groq 70B unavailable: {e}")
+            logger.warning(f"⚠️ Groq 70B unavailable: {e}")
 
-    # ── Gemini second ──
+    # ── 2. Gemini 2.5 Flash (second — good quality, free) ──
     if settings.google_api_key:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
             models.append({
-                "name": "Gemini / gemini-2.5-flash-lite",
+                "name": "Google / gemini-2.5-flash-lite",
                 "llm": ChatGoogleGenerativeAI(
                     model="gemini-2.5-flash-lite",
                     google_api_key=settings.google_api_key,
                     temperature=0.1,
                     max_output_tokens=4096,
-                ).bind_tools(ALL_TOOLS),
-                "rate_errors": ["429", "quota", "resource exhausted", "resourceexhausted"],
+                ),
+                "rate_limit_errors": ["429", "quota", "resource exhausted", "resourceexhausted"],
             })
-            logger.info("✅ Model loaded: Gemini gemini-2.5-flash-lite")
+            logger.info("✅ Model loaded: Google gemini-2.5-flash-lite")
         except Exception as e:
-            logger.warning(f"Gemini unavailable: {e}")
+            logger.warning(f"⚠️ Gemini unavailable: {e}")
 
-    # ── Groq 8B — high rate limits, last resort ──
+    # ── 3. Zhipu GLM-4-Flash (third — free, generous limits) ──
+    if settings.zhipu_api_key:
+        try:
+            from langchain_openai import ChatOpenAI
+            models.append({
+                "name": "Zhipu / glm-4-flash",
+                "llm": ChatOpenAI(
+                    model="glm-4-flash",
+                    api_key=settings.zhipu_api_key,
+                    base_url="https://open.bigmodel.cn/api/paas/v4/",
+                    max_tokens=4096,
+                    temperature=0.1,
+                ),
+                "rate_limit_errors": ["429", "rate limit", "RateLimitError", "too many requests"],
+            })
+            logger.info("✅ Model loaded: Zhipu glm-4-flash")
+        except Exception as e:
+            logger.warning(f"⚠️ Zhipu GLM unavailable: {e}")
+
+    # ── 4. Groq Llama 3.1 8B (last resort — very high RPM) ──
     if settings.groq_api_key:
         try:
             from langchain_groq import ChatGroq
@@ -108,47 +186,31 @@ def build_llm():
                     groq_api_key=settings.groq_api_key,
                     max_tokens=4096,
                     temperature=0.1,
-                ).bind_tools(ALL_TOOLS),
-                "rate_errors": ["rate_limit_exceeded", "429", "too many requests"],
+                ),
+                "rate_limit_errors": ["rate_limit_exceeded", "429", "RateLimitError", "Too Many Requests"],
             })
             logger.info("✅ Model loaded: Groq llama-3.1-8b-instant")
         except Exception as e:
-            logger.warning(f"Groq 8B unavailable: {e}")
+            logger.warning(f"⚠️ Groq 8B unavailable: {e}")
 
     if not models:
-        raise RuntimeError("No LLM configured! Set GROQ_API_KEY or GOOGLE_API_KEY")
+        raise RuntimeError("No LLM configured! Set at least one of: GROQ_API_KEY, GOOGLE_API_KEY, ZHIPU_API_KEY")
 
     logger.info(f"🔗 Fallback chain: {' → '.join(m['name'] for m in models)}")
     return models
 
 
-async def invoke_with_fallback(models, messages):
-    last_error = None
-    for i, m in enumerate(models):
-        try:
-            response = await m["llm"].ainvoke(messages)
-            if i > 0:
-                logger.info(f"✅ Fell back to: {m['name']}")
-            return response
-        except Exception as e:
-            err = str(e).lower()
-            if any(r in err for r in m["rate_errors"]):
-                logger.warning(f"⚡ Rate limit on {m['name']}, trying next...")
-                last_error = e
-                await asyncio.sleep(1)
-                continue
-            raise e
-    raise RuntimeError(f"All models exhausted. Last error: {last_error}")
-
+# ─── Build Agent ──────────────────────────────────────────────────────────────
 
 def build_agent():
-    llm_chain = build_llm()
+    model_chain = build_model_chain()
+    fallback_llm = FallbackLLM(model_chain, ALL_TOOLS)
 
     async def call_model(state: AgentState):
         messages = list(state["messages"])
         if not any(isinstance(m, SystemMessage) for m in messages):
             messages = [SystemMessage(content=APPLY_SYSTEM_PROMPT)] + messages
-        response = await invoke_with_fallback(llm_chain, messages)
+        response = await fallback_llm.ainvoke(messages)
         return {"messages": [response]}
 
     graph = StateGraph(AgentState)
@@ -163,19 +225,20 @@ def build_agent():
 job_agent = build_agent()
 
 
+# ─── Auto Apply (called from main.py) ────────────────────────────────────────
+
 async def run_auto_apply(
     candidate: dict,
     job_ids: list[str],
     session_id: str,
     history: list = None,
 ) -> tuple[str, list]:
-    """Apply to pre-filtered jobs (already scored >=80%)."""
+    """Apply to pre-filtered jobs (already scored ≥80%)."""
     import json
     from db.supabase_client import supabase
 
     history = history or []
 
-    # Fetch full job details from DB
     jobs = []
     for job_id in job_ids:
         try:
@@ -189,8 +252,6 @@ async def run_auto_apply(
         return "No valid jobs found to apply to.", history
 
     has_pdf_cv = (candidate.get("base_resume_text") or "").startswith("PDF:")
-
-    # Strip base_resume_text from candidate dict shown in prompt (too long)
     candidate_display = {k: v for k, v in candidate.items() if k != "base_resume_text"}
 
     prompt = f"""Apply to these {len(jobs)} pre-matched jobs for this candidate.
@@ -198,7 +259,7 @@ async def run_auto_apply(
 CANDIDATE:
 {json.dumps(candidate_display, indent=2)}
 
-{"NOTE: Candidate has uploaded a PDF CV. The full CV text is in candidate base_resume_text field — reference it when building resumes." if has_pdf_cv else "NOTE: No PDF CV. Use profile data only."}
+{"NOTE: Candidate has uploaded a PDF CV — reference base_resume_text when building resumes." if has_pdf_cv else "NOTE: No PDF CV — use profile data only."}
 
 JOBS TO APPLY:
 {json.dumps([{
@@ -211,7 +272,7 @@ JOBS TO APPLY:
     "skills_required": j.get("skills_required", []),
 } for j in jobs], indent=2)}
 
-Process each job in order. For resume_id always use the full UUID returned by build_resume."""
+Process each job. Use the full UUID from build_resume as resume_id."""
 
     messages = [HumanMessage(content=prompt)]
     result = await job_agent.ainvoke({"messages": messages})
@@ -224,18 +285,13 @@ Process each job in order. For resume_id always use the full UUID returned by bu
     return response, updated_history
 
 
-async def run_job_search(
-    candidate: dict,
-    job_query: str,
-    location: str = "India",
-    history: list = None
-) -> tuple[str, list]:
-    """Legacy single-step search+apply (kept for compatibility)."""
+# ─── Legacy ───────────────────────────────────────────────────────────────────
+
+async def run_job_search(candidate: dict, job_query: str, location: str = "India", history: list = None) -> tuple[str, list]:
     import json
     history = history or []
     prompt = f"Search and apply for {job_query} jobs in {location} for candidate: {json.dumps(candidate, indent=2)}"
     messages = [HumanMessage(content=prompt)]
     result = await job_agent.ainvoke({"messages": messages})
     response = result["messages"][-1].content
-    updated_history = history + [{"role": "user", "content": prompt}, {"role": "assistant", "content": response}]
-    return response, updated_history
+    return response, history + [{"role": "user", "content": prompt}, {"role": "assistant", "content": response}]

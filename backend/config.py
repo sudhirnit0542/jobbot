@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     # LLM Keys
     groq_api_key: str = ""
     google_api_key: str = ""
+    zhipu_api_key: str = ""          # bigmodel.cn — free, register at open.bigmodel.cn
     anthropic_api_key: str = ""
 
     # Adzuna Job Search API (free — register at developer.adzuna.com)
