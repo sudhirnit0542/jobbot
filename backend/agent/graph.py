@@ -156,14 +156,14 @@ def build_model_chain() -> list[dict]:
         except Exception as e:
             logger.warning(f"⚠️ Gemini unavailable: {e}")
 
-    # ── 3. Zhipu GLM-4-Flash (third — free, generous limits) ──
+    # ── 3. Zhipu glm-4.7-flash (third — free, generous limits) ──
     if settings.zhipu_api_key:
         try:
             from langchain_openai import ChatOpenAI
             models.append({
-                "name": "Zhipu / glm-4-flash",
+                "name": "Zhipu / glm-4.7-flash",
                 "llm": ChatOpenAI(
-                    model="glm-4-flash",
+                    model="glm-4.7-flash",
                     api_key=settings.zhipu_api_key,
                     base_url="https://open.bigmodel.cn/api/paas/v4/",
                     max_tokens=4096,
