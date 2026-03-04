@@ -26,25 +26,94 @@ settings = get_settings()
 
 security = HTTPBearer()
 
+# Cache JWKS keys so we don't fetch on every request
+_jwks_cache: dict = {}
+
+def _get_jwks() -> dict:
+    """Fetch Supabase public JWKS (cached in memory)."""
+    global _jwks_cache
+    if _jwks_cache:
+        return _jwks_cache
+    import urllib.request
+    jwks_url = f"{settings.supabase_url}/auth/v1/.well-known/jwks.json"
+    try:
+        with urllib.request.urlopen(jwks_url, timeout=5) as r:
+            _jwks_cache = json.loads(r.read())
+            logger.info(f"JWKS loaded: {len(_jwks_cache.get('keys', []))} keys")
+            return _jwks_cache
+    except Exception as e:
+        logger.error(f"Failed to fetch JWKS from {jwks_url}: {e}")
+        return {}
+
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """
-    Validate Supabase JWT token from Authorization header.
-    Returns decoded user payload {sub: user_id, email: ...}
+    Validate Supabase JWT — supports both ES256 (new projects) and HS256 (legacy).
+    Returns decoded payload {sub, email, ...}
     """
     token = credentials.credentials
+
+    # Peek at header to get algorithm and kid
     try:
-        # Decode using Supabase JWT secret (HS256)
-        payload = pyjwt.decode(
-            token,
-            settings.supabase_jwt_secret,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
-        )
+        header = pyjwt.get_unverified_header(token)
+        alg = header.get("alg", "HS256")
+        kid = header.get("kid")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token header: {e}")
+
+    try:
+        if alg == "HS256":
+            # Legacy Supabase projects — symmetric secret
+            payload = pyjwt.decode(
+                token,
+                settings.supabase_jwt_secret,
+                algorithms=["HS256"],
+                options={"verify_aud": False},
+            )
+        else:
+            # Modern Supabase projects — ES256 with JWKS
+            jwks = _get_jwks()
+            keys = jwks.get("keys", [])
+            if not keys:
+                raise HTTPException(status_code=500, detail="Could not load auth public keys")
+
+            # Find matching key by kid
+            signing_key = None
+            for k in keys:
+                if not kid or k.get("kid") == kid:
+                    signing_key = pyjwt.algorithms.ECAlgorithm.from_jwk(json.dumps(k))
+                    break
+
+            if not signing_key:
+                # Retry with fresh JWKS in case keys rotated
+                global _jwks_cache
+                _jwks_cache = {}
+                jwks = _get_jwks()
+                for k in jwks.get("keys", []):
+                    if not kid or k.get("kid") == kid:
+                        signing_key = pyjwt.algorithms.ECAlgorithm.from_jwk(json.dumps(k))
+                        break
+
+            if not signing_key:
+                raise HTTPException(status_code=401, detail=f"No matching public key for kid={kid}")
+
+            payload = pyjwt.decode(
+                token,
+                signing_key,
+                algorithms=["ES256"],
+                options={"verify_aud": False},
+            )
+
         return payload
+
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired — please log in again")
     except pyjwt.InvalidTokenError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Auth error: {e}")
+        raise HTTPException(status_code=401, detail=f"Auth failed: {e}")
 
 def get_candidate_id_for_user(user: dict) -> str:
     """Get or create candidate record for authenticated user."""
