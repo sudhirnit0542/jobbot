@@ -1,4 +1,9 @@
 import { useState, useEffect, useRef } from "react"
+import { createClient } from "@supabase/supabase-js"
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || ""
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || ""
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000"
 
@@ -12,8 +17,16 @@ const STATUS_COLORS = {
 }
 
 export default function App() {
+  const [user, setUser] = useState(null)          // Supabase auth user
+  const [authToken, setAuthToken] = useState("")  // JWT for API calls
+  const [authView, setAuthView] = useState("login") // login | signup
+  const [authEmail, setAuthEmail] = useState("")
+  const [authPassword, setAuthPassword] = useState("")
+  const [authName, setAuthName] = useState("")
+  const [authError, setAuthError] = useState("")
+  const [authLoading, setAuthLoading] = useState(false)
   const [tab, setTab] = useState("profile")
-  const [candidateId, setCandidateId] = useState(localStorage.getItem("jobbot_candidate_id") || "")
+  const [candidateId, setCandidateId] = useState("")
   const [candidate, setCandidate] = useState(null)
   const [applications, setApplications] = useState([])
   const [saving, setSaving] = useState(false)
@@ -36,18 +49,43 @@ export default function App() {
     experience: [], education: [], certifications: []
   })
 
+  // ── Auth: listen for login/logout ──
   useEffect(() => {
-    if (candidateId) {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session) {
+        setUser(session.user)
+        setAuthToken(session.access_token)
+      }
+    })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session) {
+        setUser(session.user)
+        setAuthToken(session.access_token)
+      } else {
+        setUser(null)
+        setAuthToken("")
+        setCandidateId("")
+        setCandidate(null)
+      }
+    })
+    return () => subscription.unsubscribe()
+  }, [])
+
+  // ── Load candidate when logged in ──
+  useEffect(() => {
+    if (authToken) {
       fetchCandidate()
       fetchApplications()
     }
-    // Cleanup polling on unmount
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [candidateId])
+  }, [authToken])
+
+  const authHeaders = () => ({ "Authorization": `Bearer ${authToken}`, "Content-Type": "application/json" })
 
   const fetchCandidate = async () => {
+    if (!authToken) return
     try {
-      const r = await fetch(`${API}/candidate/${candidateId}`)
+      const r = await fetch(`${API}/candidate/me`, { headers: authHeaders() })
       if (r.ok) {
         const data = await r.json()
         setCandidate(data)
@@ -61,8 +99,9 @@ export default function App() {
   }
 
   const fetchApplications = async () => {
+    if (!authToken) return
     try {
-      const r = await fetch(`${API}/applications/${candidateId}`)
+      const r = await fetch(`${API}/applications/me`, { headers: authHeaders() })
       if (r.ok) {
         const data = await r.json()
         setApplications(data.applications || [])
@@ -100,7 +139,7 @@ export default function App() {
     try {
       const formData = new FormData()
       formData.append("file", file)
-      const r = await fetch(`${API}/candidate/${candidateId}/upload-cv`, { method: "POST", body: formData })
+      const r = await fetch(`${API}/candidate/me/upload-cv`, { method: "POST", headers: { "Authorization": `Bearer ${authToken}` }, body: formData })
       if (r.ok) {
         const data = await r.json()
         setPdfUploaded(true)
@@ -150,7 +189,7 @@ export default function App() {
     stopPolling()
     try {
       const r = await fetch(`${API}/search/jobs`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: authHeaders(),
         body: JSON.stringify({ candidate_id: candidateId, ...searchForm })
       })
       if (r.ok) setSearchResults(await r.json())
@@ -168,7 +207,7 @@ export default function App() {
     setApplyStarted(true)
     try {
       const r = await fetch(`${API}/search/apply`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: authHeaders(),
         body: JSON.stringify({ candidate_id: candidateId, session_id: searchResults.session_id, job_ids: matchedIds })
       })
       if (r.ok) {
@@ -199,6 +238,88 @@ export default function App() {
   const reviewJobs  = searchResults?.jobs?.filter(j => j.match_score >= 60 && j.match_score < 80) || []
   const skippedJobs = searchResults?.jobs?.filter(j => j.match_score < 60) || []
 
+  // ── Show login screen if not authenticated ──
+  if (!user) {
+    const isLogin = authView === "login"
+    return (
+      <div style={{ minHeight: "100vh", background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
+                    display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Arial, sans-serif" }}>
+        <div style={{ background: "#fff", borderRadius: 16, padding: "40px 44px", width: 400,
+                      boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+
+          {/* Logo */}
+          <div style={{ textAlign: "center", marginBottom: 28 }}>
+            <div style={{ fontSize: 38 }}>🤖</div>
+            <div style={{ fontSize: 24, fontWeight: 800, color: "#1a5276", marginTop: 6 }}>JobBot</div>
+            <div style={{ fontSize: 13, color: "#666", marginTop: 4 }}>AI-Powered Job Application Agent</div>
+          </div>
+
+          {/* Google OAuth */}
+          <button onClick={handleGoogleLogin}
+            style={{ width: "100%", padding: "11px 16px", border: "1.5px solid #ddd", borderRadius: 8,
+                     background: "#fff", cursor: "pointer", display: "flex", alignItems: "center",
+                     justifyContent: "center", gap: 10, fontSize: 14, fontWeight: 600, color: "#333",
+                     marginBottom: 20 }}>
+            <svg width="18" height="18" viewBox="0 0 48 48">
+              <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+              <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+              <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+              <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.35-8.16 2.35-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+            </svg>
+            Continue with Google
+          </button>
+
+          {/* Divider */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+            <div style={{ flex: 1, height: 1, background: "#e0e0e0" }} />
+            <span style={{ color: "#aaa", fontSize: 12 }}>or</span>
+            <div style={{ flex: 1, height: 1, background: "#e0e0e0" }} />
+          </div>
+
+          {/* Email/Password form */}
+          {!isLogin && (
+            <input value={authName} onChange={e => setAuthName(e.target.value)}
+              placeholder="Full name"
+              style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #ddd", borderRadius: 8,
+                       fontSize: 14, marginBottom: 12, outline: "none", boxSizing: "border-box" }} />
+          )}
+          <input value={authEmail} onChange={e => setAuthEmail(e.target.value)}
+            placeholder="Email address" type="email"
+            style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #ddd", borderRadius: 8,
+                     fontSize: 14, marginBottom: 12, outline: "none", boxSizing: "border-box" }} />
+          <input value={authPassword} onChange={e => setAuthPassword(e.target.value)}
+            placeholder="Password (min 6 characters)" type="password"
+            onKeyDown={e => e.key === "Enter" && (isLogin ? handleLogin() : handleSignUp())}
+            style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #ddd", borderRadius: 8,
+                     fontSize: 14, marginBottom: 16, outline: "none", boxSizing: "border-box" }} />
+
+          {authError && (
+            <div style={{ padding: "10px 14px", borderRadius: 8, marginBottom: 14, fontSize: 13,
+                          background: authError.startsWith("✅") ? "#d4edda" : "#f8d7da",
+                          color: authError.startsWith("✅") ? "#155724" : "#721c24" }}>
+              {authError}
+            </div>
+          )}
+
+          <button onClick={isLogin ? handleLogin : handleSignUp} disabled={authLoading}
+            style={{ width: "100%", padding: "12px", background: authLoading ? "#aaa" : "linear-gradient(135deg, #1a5276, #2980b9)",
+                     color: "#fff", border: "none", borderRadius: 8, fontSize: 15, fontWeight: 700,
+                     cursor: authLoading ? "not-allowed" : "pointer", marginBottom: 16 }}>
+            {authLoading ? "Please wait…" : isLogin ? "Log In" : "Create Account"}
+          </button>
+
+          <p style={{ textAlign: "center", fontSize: 13, color: "#666" }}>
+            {isLogin ? "Don't have an account? " : "Already have an account? "}
+            <span onClick={() => { setAuthView(isLogin ? "signup" : "login"); setAuthError("") }}
+              style={{ color: "#2980b9", cursor: "pointer", fontWeight: 600 }}>
+              {isLogin ? "Sign up free" : "Log in"}
+            </span>
+          </p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div style={{ fontFamily: "'Segoe UI', sans-serif", minHeight: "100vh", background: "#f0f4f8" }}>
 
@@ -209,13 +330,28 @@ export default function App() {
             <div style={{ fontSize: 26, fontWeight: 700, letterSpacing: 1 }}>🤖 JobBot</div>
             <div style={{ fontSize: 13, opacity: 0.85 }}>AI-Powered Automatic Job Application Agent</div>
           </div>
-          {candidate && (
-            <div style={{ textAlign: "right", fontSize: 13 }}>
-              <div style={{ fontWeight: 600 }}>{candidate.name}</div>
-              <div style={{ opacity: 0.8 }}>{candidate.email}</div>
-              {pdfUploaded && <div style={{ opacity: 0.7, fontSize: 11 }}>📄 CV uploaded</div>}
+          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            {candidate && (
+              <div style={{ textAlign: "right", fontSize: 13 }}>
+                <div style={{ fontWeight: 600 }}>{candidate.name || user?.email}</div>
+                <div style={{ opacity: 0.8, fontSize: 12 }}>{user?.email}</div>
+                {pdfUploaded && <div style={{ opacity: 0.7, fontSize: 11 }}>📄 CV uploaded</div>}
+              </div>
+            )}
+            {/* User avatar */}
+            <div style={{ width: 38, height: 38, borderRadius: "50%",
+                          background: "rgba(255,255,255,0.25)",
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          fontSize: 18, fontWeight: 700, border: "2px solid rgba(255,255,255,0.4)" }}>
+              {(user?.user_metadata?.full_name || user?.email || "?")[0].toUpperCase()}
             </div>
-          )}
+            <button onClick={handleLogout}
+              style={{ padding: "6px 14px", background: "rgba(255,255,255,0.15)", color: "#fff",
+                       border: "1px solid rgba(255,255,255,0.35)", borderRadius: 6, cursor: "pointer",
+                       fontSize: 12, fontWeight: 600 }}>
+              Log out
+            </button>
+          </div>
         </div>
       </div>
 
@@ -575,6 +711,44 @@ export default function App() {
 }
 
 function JobTable({ jobs }) {
+  // ── Auth handlers ──────────────────────────────────────────────────────────
+
+  const handleSignUp = async () => {
+    if (!authEmail || !authPassword) return setAuthError("Email and password required")
+    if (authPassword.length < 6) return setAuthError("Password must be at least 6 characters")
+    setAuthLoading(true); setAuthError("")
+    const { error } = await supabase.auth.signUp({
+      email: authEmail, password: authPassword,
+      options: { data: { full_name: authName } }
+    })
+    setAuthLoading(false)
+    if (error) setAuthError(error.message)
+    else setAuthError("✅ Check your email to confirm your account, then log in.")
+  }
+
+  const handleLogin = async () => {
+    if (!authEmail || !authPassword) return setAuthError("Email and password required")
+    setAuthLoading(true); setAuthError("")
+    const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword })
+    setAuthLoading(false)
+    if (error) setAuthError(error.message)
+  }
+
+  const handleGoogleLogin = async () => {
+    setAuthError("")
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: window.location.origin }
+    })
+    if (error) setAuthError(error.message)
+  }
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut()
+    setTab("profile")
+  }
+
+
   return (
     <table style={{ width: "100%", borderCollapse: "collapse" }}>
       <thead>

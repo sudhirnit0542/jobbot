@@ -36,3 +36,5 @@ cryptography==42.0.8
 pydantic==2.7.4
 pydantic-settings==2.3.4
 loguru==0.7.2
+
+PyJWT==2.8.0

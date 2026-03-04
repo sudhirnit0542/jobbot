@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     # Supabase
     supabase_url: str = ""
     supabase_service_key: str = ""
+    supabase_jwt_secret: str = ""   # Settings → API → JWT Secret in Supabase dashboard
 
     # LLM Keys
     groq_api_key: str = ""

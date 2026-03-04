@@ -2,13 +2,15 @@
 JobBot FastAPI Backend
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from loguru import logger
 from datetime import datetime
 import json
 import io
+import jwt as pyjwt
 
 from config import get_settings
 from agent.graph import run_auto_apply
@@ -19,6 +21,52 @@ from db.supabase_client import (
 )
 
 settings = get_settings()
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+security = HTTPBearer()
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Validate Supabase JWT token from Authorization header.
+    Returns decoded user payload {sub: user_id, email: ...}
+    """
+    token = credentials.credentials
+    try:
+        # Decode using Supabase JWT secret (HS256)
+        payload = pyjwt.decode(
+            token,
+            settings.supabase_jwt_secret,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        return payload
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired — please log in again")
+    except pyjwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+def get_candidate_id_for_user(user: dict) -> str:
+    """Get or create candidate record for authenticated user."""
+    user_id = user.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user token")
+    try:
+        r = supabase.table("candidates").select("id").eq("user_id", user_id).single().execute()
+        if r.data:
+            return r.data["id"]
+    except:
+        pass
+    # Auto-create candidate row if missing (e.g. trigger didn't fire)
+    email = user.get("email", "")
+    name = user.get("user_metadata", {}).get("full_name") or email.split("@")[0]
+    result = supabase.table("candidates").insert({
+        "user_id": user_id, "name": name, "email": email
+    }).execute()
+    if result.data:
+        return result.data[0]["id"]
+    raise HTTPException(status_code=500, detail="Could not create candidate record")
+
 
 app = FastAPI(title="JobBot API", version="1.0.0")
 
@@ -68,9 +116,10 @@ async def health():
 # ─── Candidate ────────────────────────────────────────────────────────────────
 
 @app.post("/candidate")
-async def save_candidate(profile: CandidateProfile):
+async def save_candidate(profile: CandidateProfile, user: dict = Depends(get_current_user)):
     """Save or update candidate profile."""
     data = profile.dict()
+    data["user_id"] = user.get("sub")  # Link to Supabase auth user
 
     # Build base_resume_text from profile fields
     skills_text = ", ".join(data.get("skills", []))
@@ -89,16 +138,17 @@ async def save_candidate(profile: CandidateProfile):
     return {"success": True, "candidate": saved}
 
 
-@app.get("/candidate/{candidate_id}")
-async def get_candidate_profile(candidate_id: str):
+@app.get("/candidate/me")
+async def get_candidate_profile(user: dict = Depends(get_current_user)):
+    candidate_id = get_candidate_id_for_user(user)
     candidate = get_candidate(candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     return candidate
 
 
-@app.post("/candidate/{candidate_id}/upload-cv")
-async def upload_cv(candidate_id: str, file: UploadFile = File(...)):
+@app.post("/candidate/me/upload-cv")
+async def upload_cv(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     """
     Upload candidate CV as PDF.
     Extracts text and skills using AI.
@@ -369,8 +419,9 @@ async def auto_apply_to_jobs(req: ApplyRequest, background_tasks: BackgroundTask
 
 # ─── Applications Dashboard ───────────────────────────────────────────────────
 
-@app.get("/applications/{candidate_id}")
-async def get_candidate_applications(candidate_id: str):
+@app.get("/applications/me")
+async def get_candidate_applications(user: dict = Depends(get_current_user)):
+    candidate_id = get_candidate_id_for_user(user)
     apps = get_applications(candidate_id)
     summary = {
         "total": len(apps),
@@ -436,10 +487,11 @@ async def view_resume(resume_id: str):
     )
 
 
-@app.get("/resumes/{candidate_id}")
-async def list_resumes(candidate_id: str):
+@app.get("/resumes/me")
+async def list_resumes(user: dict = Depends(get_current_user)):
     """List all resumes for a candidate with download links."""
     import os
+    candidate_id = get_candidate_id_for_user(user)
     try:
         r = supabase.table("resumes").select(
             "id, job_id, match_score, pdf_path, created_at, jobs(title, company, portal)"
