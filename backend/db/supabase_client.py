@@ -178,7 +178,7 @@ async def update_application_status(app_id: str, status: str, notes: str = None,
 async def get_applications(candidate_id: str) -> list:
     try:
         r = supabase.table("applications").select(
-            "*, jobs(title, company, portal, apply_url), resumes(match_score, pdf_path)"
+            "*, jobs(title, company, portal, apply_url), resumes(id, match_score, pdf_path)"
         ).eq("candidate_id", candidate_id).order("last_updated", desc=True).execute()
         return r.data or []
     except Exception as e:
