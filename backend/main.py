@@ -382,6 +382,83 @@ async def get_candidate_applications(candidate_id: str):
     return {"summary": summary, "applications": apps}
 
 
+
+# ─── Resume Download ──────────────────────────────────────────────────────────
+
+@app.get("/resume/{resume_id}/download")
+async def download_resume(resume_id: str):
+    """Download a generated resume PDF by resume ID."""
+    from fastapi.responses import FileResponse
+    from db.supabase_client import get_resume
+    import os
+
+    resume = await get_resume(resume_id)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    pdf_path = resume.get("pdf_path", "")
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"PDF file not found on disk. Note: files are lost on Render redeploy — re-run auto-apply to regenerate."
+        )
+
+    filename = os.path.basename(pdf_path)
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=filename,
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+@app.get("/resume/{resume_id}/view")
+async def view_resume(resume_id: str):
+    """View a resume PDF inline in browser."""
+    from fastapi.responses import FileResponse
+    from db.supabase_client import get_resume
+    import os
+
+    resume = await get_resume(resume_id)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    pdf_path = resume.get("pdf_path", "")
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="PDF file not on disk — re-run auto-apply to regenerate")
+
+    filename = os.path.basename(pdf_path)
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=filename,
+        headers={"Content-Disposition": f"inline; filename={filename}"}
+    )
+
+
+@app.get("/resumes/{candidate_id}")
+async def list_resumes(candidate_id: str):
+    """List all resumes for a candidate with download links."""
+    import os
+    try:
+        r = supabase.table("resumes").select(
+            "id, job_id, match_score, pdf_path, created_at, jobs(title, company, portal)"
+        ).eq("candidate_id", candidate_id).order("created_at", desc=True).execute()
+
+        resumes = []
+        for resume in (r.data or []):
+            pdf_path = resume.get("pdf_path", "")
+            resumes.append({
+                **resume,
+                "file_exists": bool(pdf_path and os.path.exists(pdf_path)),
+                "download_url": f"/resume/{resume['id']}/download",
+                "view_url": f"/resume/{resume['id']}/view",
+            })
+
+        return {"resumes": resumes, "total": len(resumes)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

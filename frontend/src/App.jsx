@@ -528,7 +528,24 @@ export default function App() {
                             {app.applied_at ? new Date(app.applied_at).toLocaleDateString("en-IN") : "—"}
                           </td>
                           <td style={{ padding: "12px 16px" }}>
-                            {resume.pdf_path ? <span style={{ fontSize: 12, color: "#28a745" }}>✅ PDF</span> : "—"}
+                            {resume.pdf_path ? (
+                                <div style={{ display: "flex", gap: 6 }}>
+                                  <a
+                                    href={`${API}/resume/${app.resume_id || app.resumes?.id}/view`}
+                                    target="_blank" rel="noopener noreferrer"
+                                    style={{ fontSize: 11, color: "#2980b9", textDecoration: "none",
+                                             background: "#eaf4fb", borderRadius: 4, padding: "2px 7px" }}>
+                                    👁 View
+                                  </a>
+                                  <a
+                                    href={`${API}/resume/${app.resume_id || app.resumes?.id}/download`}
+                                    target="_blank" rel="noopener noreferrer"
+                                    style={{ fontSize: 11, color: "#155724", textDecoration: "none",
+                                             background: "#d4edda", borderRadius: 4, padding: "2px 7px" }}>
+                                    ⬇ PDF
+                                  </a>
+                                </div>
+                              ) : "—"}
                           </td>
                         </tr>
                       )
