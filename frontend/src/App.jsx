@@ -3,7 +3,13 @@ import { createClient } from "@supabase/supabase-js"
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || ""
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || ""
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: {
+    detectSessionInUrl: true,
+    persistSession: true,
+    autoRefreshToken: true,
+  }
+})
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000"
 
@@ -51,17 +57,37 @@ export default function App() {
 
   // ── Auth: listen for login/logout ──
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session) {
-        setUser(session.user)
-        setAuthToken(session.access_token)
-      }
-    })
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (session) {
-        setUser(session.user)
-        setAuthToken(session.access_token)
-      } else {
+    // Handle OAuth redirect — Supabase puts tokens in URL hash
+    // exchangeCodeForSession processes it and fires onAuthStateChange
+    if (window.location.hash.includes("access_token")) {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (session) {
+          setUser(session.user)
+          setAuthToken(session.access_token)
+          // Clean the URL so token isn't visible
+          window.history.replaceState({}, document.title, window.location.pathname)
+        }
+      })
+    } else {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (session) {
+          setUser(session.user)
+          setAuthToken(session.access_token)
+        }
+      })
+    }
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED") {
+        if (session) {
+          setUser(session.user)
+          setAuthToken(session.access_token)
+          // Clean URL after OAuth redirect
+          if (window.location.hash.includes("access_token")) {
+            window.history.replaceState({}, document.title, window.location.pathname)
+          }
+        }
+      } else if (event === "SIGNED_OUT") {
         setUser(null)
         setAuthToken("")
         setCandidateId("")
@@ -264,9 +290,13 @@ export default function App() {
 
   const handleGoogleLogin = async () => {
     setAuthError("")
+    const redirectTo = window.location.origin + window.location.pathname
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: window.location.origin }
+      options: {
+        redirectTo,
+        queryParams: { access_type: "offline", prompt: "consent" }
+      }
     })
     if (error) setAuthError(error.message)
   }
