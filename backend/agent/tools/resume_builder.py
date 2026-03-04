@@ -1,420 +1,451 @@
 """
-Resume Builder
-Builds tailored PDF resume by:
-1. Parsing the uploaded CV (base_resume_text) to extract full work history, education, projects
-2. Merging with structured profile data (skills, contact info)
-3. Reordering skills to match JD keywords for ATS
-4. Generating clean PDF with xhtml2pdf
+Resume Builder — JobBot
+Builds a tailored PDF resume by:
+1. Parsing the uploaded CV text (base_resume_text) into structured sections
+2. Merging with profile data (contact, skills)
+3. Reordering skills to match JD keywords for ATS optimisation
+4. Generating a clean PDF with xhtml2pdf
 """
 
 from langchain_core.tools import tool
 from loguru import logger
-import json
-import os
-import uuid
-import re
+import json, os, uuid, re
 
 RESUME_DIR = "/tmp/resumes"
 os.makedirs(RESUME_DIR, exist_ok=True)
 
+# ─── Regex helpers ────────────────────────────────────────────────────────────
 
-# ─── CV Text Parser ───────────────────────────────────────────────────────────
+DATE_RE = re.compile(
+    r'\b(?:19|20)\d{2}\b|'
+    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]+20\d{2}|'
+    r'\bPresent\b|\bCurrent\b|\btill\s+date\b',
+    re.IGNORECASE
+)
+
+SECTION_MAP = [
+    (r'summary|profile|objective|about|overview',              'summary'),
+    (r'experience|employment|work.?history|career|positions?', 'experience'),
+    (r'education|academic|qualification',                      'education'),
+    (r'certif|license|credential|award|achievement',           'certifications'),
+    (r'project|portfolio',                                     'projects'),
+    (r'skill|technical|competenc|expertise|technolog',         'skills'),
+]
+
+def _classify_section(line: str):
+    clean = re.sub(
+        r'^(professional|technical|work|key|core|additional|relevant)\s+',
+        '', line.strip(), flags=re.I
+    ).rstrip(':').strip().lower()
+    for pattern, name in SECTION_MAP:
+        if re.match(pattern, clean):
+            return name
+    return None
+
+def _is_section_header(line: str) -> bool:
+    s = line.strip().rstrip(':').strip()
+    if not s or len(s) > 70:
+        return False
+    words = [w for w in s.split() if w.isalpha()]
+    if words and all(w.isupper() for w in words):
+        return True
+    return bool(_classify_section(s))
+
+def _year(text: str) -> str:
+    m = re.findall(r'\b(?:19|20)\d{2}\b', text)
+    return m[-1] if m else ''
+
+
+# ─── Section parsers ──────────────────────────────────────────────────────────
+
+def _parse_experience(lines: list) -> list:
+    roles, current = [], None
+
+    def _save():
+        if current and (current.get('role') or current.get('company')):
+            roles.append(current)
+
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+
+        is_bullet = s[0] in '-*'
+        has_date  = bool(DATE_RE.search(s))
+        has_pipe  = '|' in s
+
+        # Detect new role header
+        new_role = False
+        if has_pipe and has_date:
+            new_role = True
+        elif re.search(r'\s+(?:at|@)\s+', s, re.I) and has_date:
+            new_role = True
+        elif has_date and not is_bullet and len(s) < 120:
+            # "Company | Jan 2020 - Present" after a title-only line
+            if current and not current.get('duration'):
+                current['duration'] = DATE_RE.search(s).group(0) if DATE_RE.search(s) else s
+                if has_pipe:
+                    parts = [p.strip() for p in s.split('|')]
+                    if not current.get('company'):
+                        current['company'] = parts[0]
+                    current['duration'] = ' '.join(parts[1:]).strip()
+                continue
+
+        title_only = (
+            not is_bullet and not has_date and not has_pipe
+            and len(s) < 80 and s[0].isupper()
+        )
+
+        if new_role:
+            _save()
+            current = {'role': '', 'company': '', 'duration': '', 'description': '', 'achievements': []}
+            if has_pipe:
+                parts = [p.strip() for p in s.split('|')]
+                current['role']     = parts[0]
+                current['company']  = parts[1] if len(parts) > 1 else ''
+                current['duration'] = parts[2] if len(parts) > 2 else (parts[-1] if len(parts) > 1 else '')
+            else:
+                m = re.match(r'(.+?)\s+(?:at|@)\s+(.+?)(?:\s*[|\u2013\u2014\-]\s*(.+))?$', s, re.I)
+                if m:
+                    current['role'], current['company'] = m.group(1).strip(), m.group(2).strip()
+                    current['duration'] = (m.group(3) or '').strip()
+                else:
+                    current['role'] = s
+        elif title_only and current is None:
+            current = {'role': s, 'company': '', 'duration': '', 'description': '', 'achievements': []}
+        elif is_bullet and current is not None:
+            current['achievements'].append(re.sub(r'^[-*]\s*', '', s))
+        elif current is not None:
+            if not current.get('company') and not has_date:
+                current['company'] = s
+            elif not current.get('description'):
+                current['description'] = s
+            else:
+                current['description'] += ' ' + s
+
+    _save()
+    return roles
+
+
+def _parse_education(lines: list) -> list:
+    entries, current = [], None
+
+    for line in lines:
+        s = line.strip()
+        if not s or s[0] in '-*':
+            continue
+
+        year = _year(s)
+        has_grade = bool(re.search(r'\b(?:GPA|CGPA|grade|percentage|%|score|marks)\b', s, re.I))
+
+        if has_grade:
+            if current:
+                current['grade'] = s
+            continue
+
+        if current and not current.get('institution') and not year:
+            current['institution'] = s
+        elif current and year and not current.get('year'):
+            current['year'] = year
+            inst = re.sub(DATE_RE, '', s).strip(' |\u2013\u2014-,')
+            if inst and not current.get('institution'):
+                current['institution'] = inst
+        else:
+            if current:
+                entries.append(current)
+            current = {'degree': s, 'institution': '', 'year': year or '', 'grade': ''}
+
+    if current:
+        entries.append(current)
+    return entries
+
+
+# ─── Main CV parser ───────────────────────────────────────────────────────────
 
 def parse_cv_text(cv_text: str) -> dict:
-    """
-    Parse raw CV/resume text into structured sections.
-    Handles most common resume formats.
-    Returns: {summary, experience, education, certifications, projects, skills_raw}
-    """
+    """Parse raw CV/resume text into structured sections."""
     if not cv_text:
         return {}
 
-    # Strip the PDF: prefix added during upload
-    text = cv_text.replace("PDF:", "", 1).strip()
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    text  = re.sub(r'^PDF:', '', cv_text.strip(), flags=re.I).strip()
+    lines = text.split('\n')
 
-    parsed = {
-        "raw_text": text,
-        "summary": "",
-        "experience": [],
-        "education": [],
-        "certifications": [],
-        "projects": [],
-        "skills_raw": [],
+    result = {
+        'raw_text': text, 'name': '', 'summary': '',
+        'experience_structured': [], 'education_structured': [],
+        'certifications': [], 'projects': [], 'skills_raw': [],
     }
 
-    # Section header patterns
-    SECTION_PATTERNS = {
-        "summary":        r"(summary|profile|objective|about|overview)",
-        "experience":     r"(experience|employment|work history|career|positions?)",
-        "education":      r"(education|academic|qualification|degree)",
-        "certifications": r"(certif|license|credential|award)",
-        "projects":       r"(project|portfolio|work sample)",
-        "skills":         r"(skill|technical|competenc|expertise|technology)",
-    }
+    # Identify section boundaries
+    sections = []
+    for i, line in enumerate(lines):
+        if _is_section_header(line):
+            sec = _classify_section(line)
+            if sec and (not sections or sections[-1][0] != sec):
+                sections.append((sec, i))
 
-    current_section = None
-    current_block = []
+    if not sections:
+        result['experience_structured'] = _parse_experience(lines)
+        return result
 
-    def flush_block():
-        if not current_block or not current_section:
-            return
-        block_text = "\n".join(current_block).strip()
-        if current_section == "summary":
-            parsed["summary"] = block_text
-        elif current_section == "experience":
-            parsed["experience"].append(block_text)
-        elif current_section == "education":
-            parsed["education"].append(block_text)
-        elif current_section in ("certifications", "projects"):
-            items = [l for l in current_block if l]
-            parsed[current_section].extend(items)
-        elif current_section == "skills":
-            # Extract individual skills from comma/bullet separated text
-            skills_text = " ".join(current_block)
-            skills = re.split(r"[,•·|/\n\t]+", skills_text)
-            parsed["skills_raw"].extend([s.strip() for s in skills if 2 < len(s.strip()) < 40])
+    # Pre-section = name + contact
+    pre = [l.strip() for l in lines[:sections[0][1]] if l.strip()]
+    if pre:
+        result['name'] = pre[0]
 
-    for line in lines:
-        line_lower = line.lower().strip(":#- ")
+    for idx, (sec, start) in enumerate(sections):
+        end       = sections[idx + 1][1] if idx + 1 < len(sections) else len(lines)
+        body      = lines[start + 1 : end]
+        non_empty = [l for l in body if l.strip()]
 
-        # Check if this line is a section header
-        matched_section = None
-        for sec, pattern in SECTION_PATTERNS.items():
-            if re.match(pattern, line_lower) and len(line) < 50:
-                matched_section = sec
-                break
+        if sec == 'summary':
+            result['summary'] = ' '.join(l.strip() for l in non_empty)
 
-        if matched_section:
-            flush_block()
-            current_section = matched_section
-            current_block = []
-        elif current_section:
-            current_block.append(line)
+        elif sec == 'skills':
+            raw = ' '.join(l.strip() for l in non_empty)
+            result['skills_raw'] = [
+                s.strip().strip('*-')
+                for s in re.split(r'[,|\t]+', raw)
+                if 2 < len(s.strip()) < 50
+            ]
 
-    flush_block()
+        elif sec in ('certifications', 'projects'):
+            result[sec] = [
+                re.sub(r'^[-*]\s*', '', l.strip())
+                for l in non_empty if l.strip()
+            ]
 
-    # Parse experience blocks into structured dicts
-    structured_exp = []
-    for exp_block in parsed["experience"]:
-        exp_lines = [l.strip() for l in exp_block.split("\n") if l.strip()]
-        if not exp_lines:
-            continue
+        elif sec == 'experience':
+            result['experience_structured'] = _parse_experience(non_empty)
 
-        exp_entry = {
-            "role": "",
-            "company": "",
-            "duration": "",
-            "description": "",
-            "achievements": [],
-        }
+        elif sec == 'education':
+            result['education_structured'] = _parse_education(non_empty)
 
-        # First line usually: "Role at Company" or "Role | Company | Duration"
-        if exp_lines:
-            first = exp_lines[0]
-            # Try "Role at Company — Duration" pattern
-            at_match = re.match(r"(.+?)\s+(?:at|@|,)\s+(.+?)(?:\s+[|–—-]\s+(.+))?$", first, re.I)
-            pipe_match = re.match(r"(.+?)\s*[|/]\s*(.+?)\s*[|/]\s*(.+)", first)
-            if at_match:
-                exp_entry["role"] = at_match.group(1).strip()
-                exp_entry["company"] = at_match.group(2).strip()
-                exp_entry["duration"] = (at_match.group(3) or "").strip()
-            elif pipe_match:
-                exp_entry["role"] = pipe_match.group(1).strip()
-                exp_entry["company"] = pipe_match.group(2).strip()
-                exp_entry["duration"] = pipe_match.group(3).strip()
-            else:
-                exp_entry["role"] = first
+    return result
 
-        # Remaining lines → description and achievements
-        remaining = exp_lines[1:]
-        bullets = [l for l in remaining if l.startswith(("•", "-", "*", "·")) or l[0:1].isupper()]
-        non_bullets = [l for l in remaining if l not in bullets]
 
-        exp_entry["description"] = " ".join(non_bullets[:2])
-        exp_entry["achievements"] = [
-            re.sub(r"^[•\-\*·]\s*", "", b) for b in bullets[:6]
-        ]
-
-        if exp_entry["role"] or exp_entry["company"]:
-            structured_exp.append(exp_entry)
-
-    parsed["experience_structured"] = structured_exp
-
-    # Parse education blocks
-    structured_edu = []
-    for edu_block in parsed["education"]:
-        edu_lines = [l.strip() for l in edu_block.split("\n") if l.strip()]
-        if not edu_lines:
-            continue
-        entry = {"degree": edu_lines[0] if edu_lines else "",
-                 "institution": edu_lines[1] if len(edu_lines) > 1 else "",
-                 "year": "", "grade": ""}
-        # Look for year pattern
-        for line in edu_lines:
-            year_match = re.search(r"\b(19|20)\d{2}\b", line)
-            if year_match:
-                entry["year"] = year_match.group(0)
-            grade_match = re.search(r"\b(\d+\.?\d*\s*(?:GPA|CGPA|%|grade)|\b[A-F][+-]?\b)", line, re.I)
-            if grade_match:
-                entry["grade"] = grade_match.group(0)
-        structured_edu.append(entry)
-    parsed["education_structured"] = structured_edu
-
-    return parsed
-
+# ─── Merge CV + profile ───────────────────────────────────────────────────────
 
 def merge_candidate_with_cv(candidate: dict, jd_keywords: dict, match_result: dict) -> dict:
-    """
-    Merge structured profile data with parsed CV text.
-    CV text is the source of truth for experience/education.
-    Profile data is used for contact info and skills.
-    JD keywords are used to reorder/augment skills.
-    """
     merged = dict(candidate)
+    cv_text = candidate.get('base_resume_text', '')
 
-    cv_text = candidate.get("base_resume_text", "")
     if cv_text and len(cv_text) > 100:
-        logger.info(f"Parsing CV text ({len(cv_text)} chars) to extract full work history")
-        cv_data = parse_cv_text(cv_text)
+        logger.info(f"Parsing CV ({len(cv_text)} chars)")
+        cv = parse_cv_text(cv_text)
 
-        # Use CV experience if richer than profile
-        cv_exp = cv_data.get("experience_structured", [])
-        profile_exp = candidate.get("experience", [])
-        if len(cv_exp) >= len(profile_exp):
-            merged["experience"] = cv_exp
-            logger.info(f"Using CV experience: {len(cv_exp)} roles extracted")
-        else:
-            logger.info(f"Using profile experience: {len(profile_exp)} roles")
+        cv_exp  = cv.get('experience_structured', [])
+        cv_edu  = cv.get('education_structured', [])
+        cv_cert = cv.get('certifications', [])
+        cv_proj = cv.get('projects', [])
+        cv_skls = cv.get('skills_raw', [])
 
-        # Use CV education if richer
-        cv_edu = cv_data.get("education_structured", [])
-        profile_edu = candidate.get("education", [])
-        if len(cv_edu) >= len(profile_edu):
-            merged["education"] = cv_edu
+        if cv_exp:
+            merged['experience'] = cv_exp
+            logger.info(f"CV: {len(cv_exp)} roles, {len(cv_edu)} edu, {len(cv_cert)} certs")
+        if cv_edu:
+            merged['education'] = cv_edu
+        if not merged.get('summary') and cv.get('summary'):
+            merged['summary'] = cv['summary']
+        if cv_cert:
+            existing = merged.get('certifications', [])
+            merged['certifications'] = list(dict.fromkeys(existing + cv_cert))
+        if cv_proj:
+            merged['projects'] = cv_proj
 
-        # Use CV summary if profile has none
-        if not merged.get("summary") and cv_data.get("summary"):
-            merged["summary"] = cv_data["summary"]
-
-        # Merge skills: profile skills + CV-extracted skills, deduplicated
-        profile_skills = candidate.get("skills", [])
-        cv_skills = cv_data.get("skills_raw", [])
-        all_skills = list(dict.fromkeys(  # preserves order, deduplicates
+        profile_skills = candidate.get('skills', [])
+        merged['skills'] = list(dict.fromkeys(
             [s for s in profile_skills] +
-            [s for s in cv_skills if s not in profile_skills]
-        ))
-        merged["skills"] = all_skills[:40]  # Cap at 40 before JD reordering
+            [s for s in cv_skls if s not in profile_skills]
+        ))[:40]
+    else:
+        logger.info("No CV text — using profile data only")
 
-        # Merge certifications
-        profile_certs = candidate.get("certifications", [])
-        cv_certs = cv_data.get("certifications", [])
-        merged["certifications"] = list(dict.fromkeys(profile_certs + cv_certs))
-
-        # Merge projects
-        cv_projects = cv_data.get("projects", [])
-        merged["projects"] = cv_projects
-
-    # Reorder skills: JD-matched first, then rest
-    jd_must = set(s.lower() for s in jd_keywords.get("must_have", []))
-    jd_nice = set(s.lower() for s in jd_keywords.get("nice_to_have", []))
-    matched_keys = set(s.lower() for s in (
-        match_result.get("matched_must_have", []) +
-        match_result.get("matched_nice_to_have", [])
-    ))
-
-    all_skills = merged.get("skills", [])
-    # Priority 1: matched JD must-haves
-    tier1 = [s for s in all_skills if s.lower() in jd_must or s.lower() in matched_keys]
-    # Priority 2: matched nice-to-haves
-    tier2 = [s for s in all_skills if s.lower() in jd_nice and s not in tier1]
-    # Priority 3: rest
-    tier3 = [s for s in all_skills if s not in tier1 and s not in tier2]
-    merged["skills"] = (tier1 + tier2 + tier3)[:25]
-
-    logger.info(
-        f"Skills ordered: {len(tier1)} JD-matched | {len(tier2)} nice-to-have | {len(tier3)} other"
-    )
-
+    # Reorder skills: JD-matched first
+    jd_must = {s.lower() for s in jd_keywords.get('must_have', [])}
+    jd_nice = {s.lower() for s in jd_keywords.get('nice_to_have', [])}
+    matched  = {s.lower() for s in (
+        match_result.get('matched_must_have', []) +
+        match_result.get('matched_nice_to_have', [])
+    )}
+    all_s = merged.get('skills', [])
+    t1 = [s for s in all_s if s.lower() in jd_must or s.lower() in matched]
+    t2 = [s for s in all_s if s.lower() in jd_nice and s not in t1]
+    t3 = [s for s in all_s if s not in t1 and s not in t2]
+    merged['skills'] = (t1 + t2 + t3)[:25]
+    logger.info(f"Skills ordered: {len(t1)} matched | {len(t2)} nice | {len(t3)} other")
     return merged
 
 
-# ─── HTML Resume Builder ──────────────────────────────────────────────────────
+# ─── HTML template ────────────────────────────────────────────────────────────
 
-def build_tailored_resume_html(candidate: dict, jd_keywords: dict, match_result: dict) -> str:
-    """Build ATS-optimised HTML resume from merged candidate + CV data."""
+def _build_html(candidate: dict, jd_keywords: dict, match_result: dict) -> str:
+    d = merge_candidate_with_cv(candidate, jd_keywords, match_result)
 
-    # Merge CV data into candidate profile
-    merged = merge_candidate_with_cv(candidate, jd_keywords, match_result)
+    name     = d.get('name', '')
+    email    = d.get('email', '')
+    phone    = d.get('phone', '')
+    location = d.get('location', '')
+    linkedin = d.get('linkedin_url', '')
+    github   = d.get('github_url', '')
+    summary  = d.get('summary', '')
+    skills   = d.get('skills', [])
+    exps     = d.get('experience', [])
+    edus     = d.get('education', [])
+    certs    = d.get('certifications', [])
+    projects = d.get('projects', [])
 
-    name       = merged.get("name", "")
-    email      = merged.get("email", "")
-    phone      = merged.get("phone", "")
-    location   = merged.get("location", "")
-    linkedin   = merged.get("linkedin_url", "")
-    github     = merged.get("github_url", "")
-    summary    = merged.get("summary", "")
-    skills     = merged.get("skills", [])
-    experience = merged.get("experience", [])
-    education  = merged.get("education", [])
-    certs      = merged.get("certifications", [])
-    projects   = merged.get("projects", [])
+    def skills_html():
+        return ''.join(f'<span class="skill">{s}</span>' for s in skills)
 
-    skills_html = "".join(f'<span class="skill">{s}</span>' for s in skills)
+    def exp_html():
+        h = ''
+        for e in exps:
+            if isinstance(e, str):
+                h += f'<div class="exp-item"><p class="exp-desc">{e}</p></div>'
+                continue
+            ach = ''.join(f'<li>{a}</li>' for a in e.get('achievements', []) if a)
+            h += f"""
+            <div class="exp-item">
+              <div class="exp-header">
+                <div class="exp-left">
+                  <div class="exp-role">{e.get('role','')}</div>
+                  <div class="exp-company">{e.get('company','')}</div>
+                </div>
+                <div class="exp-duration">{e.get('duration','')}</div>
+              </div>
+              {"<p class='exp-desc'>" + e.get('description','') + "</p>" if e.get('description') else ""}
+              {"<ul class='achievements'>" + ach + "</ul>" if ach else ""}
+            </div>"""
+        return h
 
-    # Experience HTML
-    exp_html = ""
-    for exp in experience:
-        if isinstance(exp, str):
-            # Raw text block from CV parser fallback
-            exp_html += f'<div class="exp-item"><p class="exp-desc">{exp}</p></div>'
-            continue
-        achievements = exp.get("achievements", [])
-        ach_html = "".join(f"<li>{a}</li>" for a in achievements if a)
-        exp_html += f"""
-        <div class="exp-item">
-          <div class="exp-header">
-            <div class="exp-left">
-              <div class="exp-role">{exp.get('role','')}</div>
-              <div class="exp-company">{exp.get('company','')}</div>
-            </div>
-            <div class="exp-duration">{exp.get('duration','')}</div>
-          </div>
-          {"<p class='exp-desc'>" + exp.get('description','') + "</p>" if exp.get('description') else ""}
-          {"<ul class='achievements'>" + ach_html + "</ul>" if ach_html else ""}
-        </div>"""
+    def edu_html():
+        h = ''
+        for e in edus:
+            if isinstance(e, str):
+                h += f'<div class="edu-item"><div class="edu-degree">{e}</div></div>'
+                continue
+            h += f"""
+            <div class="edu-item">
+              <div class="edu-degree">{e.get('degree','')}</div>
+              <div class="edu-inst">{e.get('institution','')}{"&nbsp;&mdash;&nbsp;" + e.get('year','') if e.get('year') else ''}</div>
+              {"<div class='edu-grade'>" + e.get('grade','') + "</div>" if e.get('grade') else ""}
+            </div>"""
+        return h
 
-    # Education HTML
-    edu_html = ""
-    for edu in education:
-        if isinstance(edu, str):
-            edu_html += f'<div class="edu-item"><div class="edu-degree">{edu}</div></div>'
-            continue
-        edu_html += f"""
-        <div class="edu-item">
-          <div class="edu-degree">{edu.get('degree','')}</div>
-          <div class="edu-inst">{edu.get('institution','')} {('&mdash; ' + edu.get('year','')) if edu.get('year') else ''}</div>
-          {f"<div class='edu-grade'>{edu.get('grade','')}</div>" if edu.get('grade') else ""}
-        </div>"""
-
-    cert_html = "".join(f"<li>{c}</li>" for c in certs if c)
-    project_html = "".join(
-        f'<div class="exp-item"><div class="exp-role">{p}</div></div>'
+    cert_html = ''.join(f'<li>{c}</li>' for c in certs if c)
+    proj_html = ''.join(
+        f'<div class="exp-item"><p class="exp-desc">{p}</p></div>'
         if isinstance(p, str) else
-        f'<div class="exp-item"><div class="exp-role">{p.get("name","")}</div><p class="exp-desc">{p.get("description","")}</p></div>'
+        f'<div class="exp-item"><div class="exp-role">{p.get("name","")}</div>'
+        f'<p class="exp-desc">{p.get("description","")}</p></div>'
         for p in projects
     )
 
-    contact_parts = [x for x in [phone, location] if x]
-    if linkedin: contact_parts.append(f"LinkedIn: {linkedin}")
-    if github:   contact_parts.append(f"GitHub: {github}")
+    contact_line = ' &nbsp;|&nbsp; '.join(x for x in [phone, location] if x)
+    links_line   = ' &nbsp;|&nbsp; '.join(x for x in [
+        (f'LinkedIn: {linkedin}' if linkedin else ''),
+        (f'GitHub: {github}'   if github   else ''),
+    ] if x)
+
+    exp_h  = exp_html()
+    edu_h  = edu_html()
+    skl_h  = skills_html()
 
     return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8"/>
+<html><head><meta charset="UTF-8"/>
 <style>
   @page {{ margin: 1.8cm 2cm; }}
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: Arial, Helvetica, sans-serif; font-size: 10.5pt; color: #1a1a1a; line-height: 1.45; }}
-  .header {{ border-bottom: 2.5pt solid #1a5276; padding-bottom: 10pt; margin-bottom: 14pt; }}
-  .name {{ font-size: 20pt; font-weight: bold; color: #1a5276; letter-spacing: 0.5pt; }}
-  .contact {{ margin-top: 4pt; color: #444; font-size: 9.5pt; }}
-  .email {{ margin-top: 2pt; color: #444; font-size: 9.5pt; }}
-  .section {{ margin-bottom: 14pt; page-break-inside: avoid; }}
-  .section-title {{ font-size: 11pt; font-weight: bold; color: #1a5276; text-transform: uppercase;
-                    letter-spacing: 1pt; border-bottom: 0.75pt solid #aed6f1;
-                    padding-bottom: 2pt; margin-bottom: 7pt; }}
-  .summary {{ color: #333; text-align: justify; }}
-  .skill {{ display: inline-block; background: #eaf4fb; border: 0.5pt solid #aed6f1;
-            border-radius: 2pt; padding: 1.5pt 7pt; font-size: 9pt; color: #1a5276; margin: 2pt 3pt 2pt 0; }}
-  .exp-item {{ margin-bottom: 10pt; }}
-  .exp-header {{ overflow: hidden; margin-bottom: 2pt; }}
-  .exp-left {{ float: left; }}
-  .exp-role {{ font-weight: bold; font-size: 11pt; }}
-  .exp-company {{ color: #555; font-style: italic; font-size: 10pt; }}
-  .exp-duration {{ float: right; color: #555; font-size: 9.5pt; }}
-  .exp-desc {{ color: #444; margin: 3pt 0; clear: both; }}
-  .achievements {{ padding-left: 16pt; color: #333; margin-top: 3pt; }}
-  .achievements li {{ margin-bottom: 2pt; }}
-  .edu-item {{ margin-bottom: 7pt; }}
-  .edu-degree {{ font-weight: bold; }}
-  .edu-inst {{ color: #555; font-size: 10pt; }}
-  .edu-grade {{ color: #666; font-size: 9.5pt; }}
-  ul.cert-list {{ padding-left: 16pt; }}
-  ul.cert-list li {{ margin-bottom: 2pt; }}
-  .clearfix {{ clear: both; }}
-</style>
-</head>
-<body>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ font-family: Arial, Helvetica, sans-serif; font-size:10.5pt; color:#1a1a1a; line-height:1.45; }}
+  .header {{ border-bottom: 2.5pt solid #1a5276; padding-bottom:10pt; margin-bottom:14pt; }}
+  .name {{ font-size:20pt; font-weight:bold; color:#1a5276; letter-spacing:.5pt; }}
+  .contact {{ margin-top:4pt; color:#444; font-size:9.5pt; }}
+  .section {{ margin-bottom:14pt; page-break-inside:avoid; }}
+  .section-title {{ font-size:11pt; font-weight:bold; color:#1a5276; text-transform:uppercase;
+                    letter-spacing:1pt; border-bottom:.75pt solid #aed6f1; padding-bottom:2pt; margin-bottom:7pt; }}
+  .summary {{ color:#333; text-align:justify; }}
+  .skill {{ display:inline-block; background:#eaf4fb; border:.5pt solid #aed6f1; border-radius:2pt;
+            padding:1.5pt 7pt; font-size:9pt; color:#1a5276; margin:2pt 3pt 2pt 0; }}
+  .exp-item {{ margin-bottom:10pt; }}
+  .exp-header {{ overflow:hidden; margin-bottom:2pt; }}
+  .exp-left {{ float:left; }}
+  .exp-role {{ font-weight:bold; font-size:11pt; }}
+  .exp-company {{ color:#555; font-style:italic; font-size:10pt; }}
+  .exp-duration {{ float:right; color:#555; font-size:9.5pt; }}
+  .exp-desc {{ color:#444; margin:3pt 0; clear:both; }}
+  .achievements {{ padding-left:16pt; color:#333; margin-top:3pt; }}
+  .achievements li {{ margin-bottom:2pt; }}
+  .edu-item {{ margin-bottom:7pt; }}
+  .edu-degree {{ font-weight:bold; }}
+  .edu-inst {{ color:#555; font-size:10pt; }}
+  .edu-grade {{ color:#666; font-size:9.5pt; }}
+  ul.cert-list {{ padding-left:16pt; }}
+  ul.cert-list li {{ margin-bottom:2pt; }}
+  .clearfix {{ clear:both; }}
+</style></head><body>
 
 <div class="header">
   <div class="name">{name}</div>
-  <div class="contact">{" &nbsp;|&nbsp; ".join(contact_parts)}</div>
-  <div class="email">{email}</div>
+  {f'<div class="contact">{contact_line}</div>' if contact_line else ''}
+  {f'<div class="contact">{links_line}</div>'   if links_line   else ''}
+  <div class="contact">{email}</div>
 </div>
 
 {"<div class='section'><div class='section-title'>Professional Summary</div><p class='summary'>" + summary + "</p></div>" if summary else ""}
 
-{"<div class='section'><div class='section-title'>Technical Skills</div><div>" + skills_html + "</div><div class='clearfix'></div></div>" if skills else ""}
+{"<div class='section'><div class='section-title'>Technical Skills</div><div>" + skl_h + "</div><div class='clearfix'></div></div>" if skl_h else ""}
 
-{"<div class='section'><div class='section-title'>Professional Experience</div>" + exp_html + "</div>" if exp_html else ""}
+{"<div class='section'><div class='section-title'>Professional Experience</div>" + exp_h + "</div>" if exp_h else ""}
 
-{"<div class='section'><div class='section-title'>Projects</div>" + project_html + "</div>" if project_html else ""}
+{"<div class='section'><div class='section-title'>Projects</div>" + proj_html + "</div>" if proj_html else ""}
 
-{"<div class='section'><div class='section-title'>Education</div>" + edu_html + "</div>" if edu_html else ""}
+{"<div class='section'><div class='section-title'>Education</div>" + edu_h + "</div>" if edu_h else ""}
 
 {"<div class='section'><div class='section-title'>Certifications</div><ul class='cert-list'>" + cert_html + "</ul></div>" if cert_html else ""}
 
-</body>
-</html>"""
+</body></html>"""
 
 
-def html_to_pdf(html_content: str, output_path: str) -> bool:
+def _html_to_pdf(html: str, path: str) -> bool:
     try:
         from xhtml2pdf import pisa
-        with open(output_path, "wb") as f:
-            result = pisa.CreatePDF(html_content, dest=f)
-        if result.err:
-            logger.error(f"xhtml2pdf errors: {result.err}")
+        with open(path, 'wb') as f:
+            res = pisa.CreatePDF(html, dest=f)
+        if res.err:
+            logger.error(f"xhtml2pdf error: {res.err}")
             return False
-        logger.info(f"PDF created: {output_path}")
+        logger.info(f"PDF created: {path}")
         return True
     except ImportError:
-        logger.warning("xhtml2pdf not available — saving HTML fallback")
+        logger.warning("xhtml2pdf not installed")
     except Exception as e:
-        logger.error(f"PDF generation error: {e}")
-    # HTML fallback
+        logger.error(f"PDF error: {e}")
     try:
-        html_path = output_path.replace(".pdf", ".html")
-        with open(html_path, "w") as f:
-            f.write(html_content)
+        with open(path.replace('.pdf', '.html'), 'w') as f:
+            f.write(html)
     except:
         pass
     return False
 
 
-def generate_cover_letter(candidate: dict, job: dict, match_result: dict) -> str:
-    name    = candidate.get("name", "Candidate")
-    company = job.get("company", "Company")
-    role    = job.get("title", "Role")
-    matched = ", ".join(match_result.get("matched_must_have", [])[:5])
-    years   = candidate.get("experience_years", 0)
-    return f"""Dear Hiring Manager at {company},
-
-I am excited to apply for the {role} position at {company}. With {years} years of hands-on experience in {matched}, I bring both technical depth and a proven track record of delivering results.
-
-My background closely aligns with your requirements — I have worked extensively with the skills and technologies your team uses, and I am confident I can contribute meaningfully from day one.
-
-I would love the opportunity to discuss how my experience can support {company}'s goals. Thank you for your time and consideration.
-
-Best regards,
-{name}
-{candidate.get('email', '')}
-{candidate.get('phone', '')}"""
+def _cover_letter(candidate: dict, job: dict, match_result: dict) -> str:
+    name    = candidate.get('name', 'Candidate')
+    company = job.get('company', 'Company')
+    role    = job.get('title', 'the role')
+    matched = ', '.join(match_result.get('matched_must_have', [])[:5])
+    years   = candidate.get('experience_years', 0)
+    return (
+        f"Dear Hiring Manager at {company},\n\n"
+        f"I am excited to apply for the {role} position. With {years} years of experience "
+        f"in {matched}, I bring both the technical depth and product mindset your team needs.\n\n"
+        f"My background closely aligns with your requirements and I am confident in delivering "
+        f"results from day one.\n\n"
+        f"Best regards,\n{name}\n{candidate.get('email','')} | {candidate.get('phone','')}"
+    )
 
 
-# ─── Main Tool ────────────────────────────────────────────────────────────────
+# ─── Tool ─────────────────────────────────────────────────────────────────────
 
 @tool
 def build_resume(
@@ -425,62 +456,46 @@ def build_resume(
 ) -> str:
     """
     Build a tailored PDF resume for a specific job.
-
-    Sources used (in priority order):
-    1. Uploaded CV text (base_resume_text) — full work history, education, projects
-    2. Structured profile data — contact info, skills, certifications
-    3. JD keywords — used to reorder skills for ATS optimisation
+    Parses uploaded CV (base_resume_text) for full work history and education.
+    Merges with profile data. Reorders skills to match JD keywords.
 
     Args:
-        candidate_json: Full candidate profile JSON (must include base_resume_text if CV uploaded)
-        job_json: Job details (title, company, portal, apply_url)
-        jd_keywords_json: Keywords extracted from JD {"must_have": [], "nice_to_have": []}
-        match_result_json: Match result {"matched_must_have": [], "matched_nice_to_have": []}
+        candidate_json:    Full candidate profile (must include base_resume_text)
+        job_json:          {title, company, portal, apply_url}
+        jd_keywords_json:  {must_have: [], nice_to_have: []}
+        match_result_json: {matched_must_have: [], matched_nice_to_have: []}
 
     Returns:
-        JSON with pdf_path, resume_id (full UUID), cover_letter, matched_keywords_used
+        JSON {success, pdf_path, resume_id, cover_letter, matched_keywords_used, cv_used}
     """
     try:
-        candidate    = json.loads(candidate_json)    if isinstance(candidate_json, str)    else candidate_json
-        job          = json.loads(job_json)          if isinstance(job_json, str)          else job_json
-        jd_keywords  = json.loads(jd_keywords_json)  if isinstance(jd_keywords_json, str)  else jd_keywords_json
+        candidate    = json.loads(candidate_json)    if isinstance(candidate_json,    str) else candidate_json
+        job          = json.loads(job_json)          if isinstance(job_json,          str) else job_json
+        jd_keywords  = json.loads(jd_keywords_json)  if isinstance(jd_keywords_json,  str) else jd_keywords_json
         match_result = json.loads(match_result_json) if isinstance(match_result_json, str) else match_result_json
 
-        has_cv = bool(candidate.get("base_resume_text", ""))
+        has_cv = bool(candidate.get('base_resume_text', ''))
         logger.info(
-            f"Building resume for {job.get('title')} at {job.get('company')} | "
-            f"CV uploaded: {has_cv} | "
-            f"Profile skills: {len(candidate.get('skills', []))} | "
-            f"Profile experience: {len(candidate.get('experience', []))} roles"
+            f"build_resume: {job.get('title')} at {job.get('company')} | "
+            f"CV={has_cv} skills={len(candidate.get('skills',[]))} exp={len(candidate.get('experience',[]))}"
         )
 
-        resume_id    = str(uuid.uuid4())
-        company_safe = re.sub(r"[^a-zA-Z0-9]", "_", job.get("company", "company"))[:20]
-        pdf_path     = os.path.join(RESUME_DIR, f"{company_safe}_{resume_id[:8]}.pdf")
+        resume_id = str(uuid.uuid4())
+        co_safe   = re.sub(r'[^a-zA-Z0-9]', '_', job.get('company', 'co'))[:20]
+        pdf_path  = os.path.join(RESUME_DIR, f"{co_safe}_{resume_id[:8]}.pdf")
 
-        html    = build_tailored_resume_html(candidate, jd_keywords, match_result)
-        success = html_to_pdf(html, pdf_path)
-        actual_path = pdf_path if success else pdf_path.replace(".pdf", ".html")
-
-        cover_letter = generate_cover_letter(candidate, job, match_result)
-        matched_kws  = match_result.get("matched_must_have", [])
-
-        logger.info(f"Resume built: {actual_path} | keywords used: {matched_kws[:5]}")
+        html    = _build_html(candidate, jd_keywords, match_result)
+        success = _html_to_pdf(html, pdf_path)
+        path    = pdf_path if success else pdf_path.replace('.pdf', '.html')
 
         return json.dumps({
-            "success":              success,
-            "pdf_path":             actual_path,
-            "resume_id":            resume_id,
-            "cover_letter":         cover_letter,
-            "matched_keywords_used": matched_kws,
-            "cv_used":              has_cv,
-            "sections_included":    {
-                "experience": len(candidate.get("experience", [])),
-                "education":  len(candidate.get("education", [])),
-                "skills":     len(candidate.get("skills", [])),
-            },
+            'success':               success,
+            'pdf_path':              path,
+            'resume_id':             resume_id,
+            'cover_letter':          _cover_letter(candidate, job, match_result),
+            'matched_keywords_used': match_result.get('matched_must_have', []),
+            'cv_used':               has_cv,
         })
-
     except Exception as e:
         logger.error(f"build_resume error: {e}")
-        return json.dumps({"success": False, "error": str(e), "resume_id": str(uuid.uuid4())})
+        return json.dumps({'success': False, 'error': str(e), 'resume_id': str(uuid.uuid4())})

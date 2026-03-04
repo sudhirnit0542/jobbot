@@ -698,13 +698,22 @@ def apply_to_job(
 
             candidate = json.loads(candidate_json) if isinstance(candidate_json, str) else candidate_json
             job       = json.loads(job_json)       if isinstance(job_json, str)       else job_json
-            account   = (json.loads(portal_account_json)
-                         if portal_account_json and portal_account_json not in ("null","None","")
-                         else None)
-            if isinstance(account, dict) and account.get("found") is False:
-                account = None
-            if isinstance(account, dict) and account.get("account"):
-                account = account["account"]
+            # Safely parse account — LLM sometimes passes malformed JSON or plain text
+            account = None
+            if portal_account_json and portal_account_json.strip() not in ("null", "None", "", "{}"):
+                try:
+                    parsed = json.loads(portal_account_json)
+                    if isinstance(parsed, dict):
+                        # Unwrap {"found": true, "account": {...}} wrapper
+                        if parsed.get("account"):
+                            account = parsed["account"]
+                        elif parsed.get("found") is False:
+                            account = None
+                        elif parsed.get("username") or parsed.get("password_enc"):
+                            account = parsed
+                except (json.JSONDecodeError, ValueError) as je:
+                    logger.warning(f"Could not parse portal_account_json: {je} — value: {str(portal_account_json)[:80]}")
+                    account = None
 
             portal  = job.get("portal", "unknown").lower()
             title   = job.get("title", "Unknown")

@@ -5,6 +5,21 @@ Tracks all jobs found, resumes created, applications submitted, portal accounts.
 
 from langchain_core.tools import tool
 from loguru import logger
+
+def safe_json(val, fallback=None):
+    """Parse JSON safely — returns fallback on any error instead of crashing."""
+    if val is None:
+        return fallback
+    if not isinstance(val, str):
+        return val  # Already parsed
+    val = val.strip()
+    if not val or val in ("null", "None", "undefined", "{}"):
+        return fallback
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"safe_json failed: {e} | value: {val[:80]}")
+        return fallback
 import json
 import uuid
 import asyncio
