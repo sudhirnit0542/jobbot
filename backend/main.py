@@ -111,6 +111,8 @@ async def auth_me(user: dict = Depends(get_current_user)):
 # ─── Models ───────────────────────────────────────────────────────────────────
 
 class CandidateProfile(BaseModel):
+    model_config = {"extra": "ignore"}  # ignore unknown fields like id, user_id, created_at
+
     name: str
     email: str
     phone: str = ""
@@ -125,11 +127,13 @@ class CandidateProfile(BaseModel):
     summary: str = ""
 
 class SearchRequest(BaseModel):
+    model_config = {"extra": "ignore"}
     candidate_id: str
     job_query: str
     location: str = "India"
 
 class ApplyRequest(BaseModel):
+    model_config = {"extra": "ignore"}
     candidate_id: str
     session_id: str
     job_ids: list[str] = []

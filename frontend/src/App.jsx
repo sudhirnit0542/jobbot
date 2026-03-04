@@ -163,7 +163,23 @@ export default function App() {
     if (!authToken) return alert("Not logged in — please refresh and log in again")
     setSaving(true)
     try {
-      const payload = { ...profileForm, skills: profileForm.skills.split(",").map(s => s.trim()).filter(Boolean) }
+      // Only send fields the backend model expects — strip DB fields like id, user_id, created_at
+      const payload = {
+        name:             profileForm.name,
+        email:            profileForm.email,
+        phone:            profileForm.phone || "",
+        location:         profileForm.location || "",
+        linkedin_url:     profileForm.linkedin_url || "",
+        github_url:       profileForm.github_url || "",
+        summary:          profileForm.summary || "",
+        experience_years: parseInt(profileForm.experience_years) || 0,
+        skills:           typeof profileForm.skills === "string"
+                            ? profileForm.skills.split(",").map(s => s.trim()).filter(Boolean)
+                            : (profileForm.skills || []),
+        experience:       profileForm.experience || [],
+        education:        profileForm.education || [],
+        certifications:   profileForm.certifications || [],
+      }
       const r = await fetch(`${API}/candidate`, { method: "POST", headers: authHeaders(), body: JSON.stringify(payload) })
       if (r.ok) {
         const data = await r.json()
