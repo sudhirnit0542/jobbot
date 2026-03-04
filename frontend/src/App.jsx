@@ -57,43 +57,26 @@ export default function App() {
 
   // ── Auth: listen for login/logout ──
   useEffect(() => {
-    // Handle OAuth redirect — Supabase puts tokens in URL hash
-    // exchangeCodeForSession processes it and fires onAuthStateChange
-    if (window.location.hash.includes("access_token")) {
-      supabase.auth.getSession().then(({ data: { session } }) => {
-        if (session) {
-          setUser(session.user)
-          setAuthToken(session.access_token)
-          // Clean the URL so token isn't visible
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (session) {
+        setUser(session.user)
+        setAuthToken(session.access_token)
+        // Clean the ugly token hash from the URL bar
+        if (window.location.hash.includes("access_token")) {
           window.history.replaceState({}, document.title, window.location.pathname)
         }
-      })
-    } else {
-      supabase.auth.getSession().then(({ data: { session } }) => {
-        if (session) {
-          setUser(session.user)
-          setAuthToken(session.access_token)
-        }
-      })
-    }
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED") {
-        if (session) {
-          setUser(session.user)
-          setAuthToken(session.access_token)
-          // Clean URL after OAuth redirect
-          if (window.location.hash.includes("access_token")) {
-            window.history.replaceState({}, document.title, window.location.pathname)
-          }
-        }
-      } else if (event === "SIGNED_OUT") {
+      } else {
         setUser(null)
         setAuthToken("")
         setCandidateId("")
         setCandidate(null)
       }
     })
+
+    // getSession() triggers Supabase to parse #access_token from URL hash
+    // Must be called AFTER onAuthStateChange is registered
+    supabase.auth.getSession()
+
     return () => subscription.unsubscribe()
   }, [])
 
