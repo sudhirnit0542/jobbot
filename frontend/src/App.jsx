@@ -238,6 +238,44 @@ export default function App() {
   const reviewJobs  = searchResults?.jobs?.filter(j => j.match_score >= 60 && j.match_score < 80) || []
   const skippedJobs = searchResults?.jobs?.filter(j => j.match_score < 60) || []
 
+
+  // ── Auth handlers ──────────────────────────────────────────────────────────
+
+  const handleSignUp = async () => {
+    if (!authEmail || !authPassword) return setAuthError("Email and password required")
+    if (authPassword.length < 6) return setAuthError("Password must be at least 6 characters")
+    setAuthLoading(true); setAuthError("")
+    const { error } = await supabase.auth.signUp({
+      email: authEmail, password: authPassword,
+      options: { data: { full_name: authName } }
+    })
+    setAuthLoading(false)
+    if (error) setAuthError(error.message)
+    else setAuthError("✅ Check your email to confirm your account, then log in.")
+  }
+
+  const handleLogin = async () => {
+    if (!authEmail || !authPassword) return setAuthError("Email and password required")
+    setAuthLoading(true); setAuthError("")
+    const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword })
+    setAuthLoading(false)
+    if (error) setAuthError(error.message)
+  }
+
+  const handleGoogleLogin = async () => {
+    setAuthError("")
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: window.location.origin }
+    })
+    if (error) setAuthError(error.message)
+  }
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut()
+    setTab("profile")
+  }
+
   // ── Show login screen if not authenticated ──
   if (!user) {
     const isLogin = authView === "login"
@@ -711,44 +749,6 @@ export default function App() {
 }
 
 function JobTable({ jobs }) {
-  // ── Auth handlers ──────────────────────────────────────────────────────────
-
-  const handleSignUp = async () => {
-    if (!authEmail || !authPassword) return setAuthError("Email and password required")
-    if (authPassword.length < 6) return setAuthError("Password must be at least 6 characters")
-    setAuthLoading(true); setAuthError("")
-    const { error } = await supabase.auth.signUp({
-      email: authEmail, password: authPassword,
-      options: { data: { full_name: authName } }
-    })
-    setAuthLoading(false)
-    if (error) setAuthError(error.message)
-    else setAuthError("✅ Check your email to confirm your account, then log in.")
-  }
-
-  const handleLogin = async () => {
-    if (!authEmail || !authPassword) return setAuthError("Email and password required")
-    setAuthLoading(true); setAuthError("")
-    const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword })
-    setAuthLoading(false)
-    if (error) setAuthError(error.message)
-  }
-
-  const handleGoogleLogin = async () => {
-    setAuthError("")
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: "google",
-      options: { redirectTo: window.location.origin }
-    })
-    if (error) setAuthError(error.message)
-  }
-
-  const handleLogout = async () => {
-    await supabase.auth.signOut()
-    setTab("profile")
-  }
-
-
   return (
     <table style={{ width: "100%", borderCollapse: "collapse" }}>
       <thead>
