@@ -57,15 +57,15 @@ export default function App() {
 
   // ── Auth: listen for login/logout ──
   useEffect(() => {
+    // Step 1: register listener first
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (session) {
         setUser(session.user)
         setAuthToken(session.access_token)
-        // Clean the ugly token hash from the URL bar
         if (window.location.hash.includes("access_token")) {
           window.history.replaceState({}, document.title, window.location.pathname)
         }
-      } else {
+      } else if (event === "SIGNED_OUT") {
         setUser(null)
         setAuthToken("")
         setCandidateId("")
@@ -73,9 +73,29 @@ export default function App() {
       }
     })
 
-    // getSession() triggers Supabase to parse #access_token from URL hash
-    // Must be called AFTER onAuthStateChange is registered
-    supabase.auth.getSession()
+    // Step 2: manually handle OAuth hash redirect
+    // Supabase v2 with ES module bundlers sometimes misses the hash
+    const hash = window.location.hash
+    if (hash && hash.includes("access_token")) {
+      const params = new URLSearchParams(hash.replace("#", ""))
+      const accessToken  = params.get("access_token")
+      const refreshToken = params.get("refresh_token")
+      if (accessToken && refreshToken) {
+        supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken })
+          .then(({ data, error }) => {
+            if (error) console.error("setSession error:", error)
+            // onAuthStateChange will fire SIGNED_IN and update state
+          })
+      }
+    } else {
+      // Normal page load — restore existing session
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (session) {
+          setUser(session.user)
+          setAuthToken(session.access_token)
+        }
+      })
+    }
 
     return () => subscription.unsubscribe()
   }, [])
