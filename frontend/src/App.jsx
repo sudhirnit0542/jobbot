@@ -160,16 +160,16 @@ export default function App() {
   // ── Save Profile ───────────────────────────────────────────────────────────
   const saveProfile = async () => {
     if (!profileForm.name || !profileForm.email) return alert("Name and Email are required")
+    if (!authToken) return alert("Not logged in — please refresh and log in again")
     setSaving(true)
     try {
       const payload = { ...profileForm, skills: profileForm.skills.split(",").map(s => s.trim()).filter(Boolean) }
-      const r = await fetch(`${API}/candidate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+      const r = await fetch(`${API}/candidate`, { method: "POST", headers: authHeaders(), body: JSON.stringify(payload) })
       if (r.ok) {
         const data = await r.json()
         const newId = data.candidate?.id
         if (newId) {
           setCandidateId(newId)
-          localStorage.setItem("jobbot_candidate_id", newId)
           setCandidate(data.candidate)
           alert("✅ Profile saved!")
         }
