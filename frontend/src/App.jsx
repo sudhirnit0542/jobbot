@@ -547,6 +547,19 @@ export default function App() {
                                 </div>
                               ) : "—"}
                           </td>
+                          <td style={{ padding: "12px 16px", maxWidth: 220 }}>
+                            {app.error_message ? (
+                              <span title={app.error_message}
+                                style={{ fontSize: 11, color: "#721c24", background: "#f8d7da",
+                                         borderRadius: 4, padding: "2px 7px", display: "block",
+                                         overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                                         maxWidth: 200, cursor: "help" }}>
+                                ⚠ {app.error_message.substring(0, 60)}{app.error_message.length > 60 ? "…" : ""}
+                              </span>
+                            ) : app.notes ? (
+                              <span style={{ fontSize: 11, color: "#555" }}>{app.notes.substring(0, 60)}</span>
+                            ) : "—"}
+                          </td>
                         </tr>
                       )
                     })}

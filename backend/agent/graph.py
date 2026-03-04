@@ -26,17 +26,29 @@ settings = get_settings()
 
 APPLY_SYSTEM_PROMPT = """You are JobBot — apply to pre-matched jobs for a candidate.
 
-For each job in the list:
-1. check_already_applied — skip if true
-2. get_portal_credentials — get existing account if any
-3. build_resume — create tailored PDF using candidate profile + JD
-4. apply_to_job — submit application
-5. If new account was created → save_portal_credentials
-6. record_application — log APPLIED or FAILED
-7. save_resume_to_repo — save resume record
+For each job, follow these steps IN ORDER:
 
-IMPORTANT: Always use the full UUID from build_resume result as resume_id.
-Report each job: ✅ Applied | ❌ Failed | ⏭ Already applied"""
+1. check_already_applied(candidate_id, job_id) — if true, skip this job
+2. get_portal_credentials(candidate_id, portal) — get existing account if any
+3. build_resume(candidate_json, job_json, jd_keywords_json, match_result_json) — generate tailored PDF
+4. apply_to_job(candidate_json, job_json, pdf_path, portal_account_json) — submit application
+5. save_resume_to_repo(...) — MUST be called BEFORE record_application, use id from result as resume_id
+6. If apply_to_job returned new_account → save_portal_credentials
+7. record_application(candidate_id, job_id, resume_id, portal, status, error_message=...) — log result
+
+CRITICAL RULES:
+- resume_id in record_application MUST be the full UUID from save_resume_to_repo result
+- status must reflect apply_to_job result:
+  * apply_to_job success=True → status="APPLIED"
+  * apply_to_job status="SKIPPED" → status="SKIPPED"  
+  * apply_to_job success=False → status="FAILED", copy the "error" field into error_message
+- ALWAYS pass error_message when status is FAILED — copy it from apply_to_job "error" field exactly
+- ALWAYS save_resume_to_repo BEFORE record_application
+
+After all jobs, report:
+✅ APPLIED: <title> at <company>
+❌ FAILED: <title> at <company> — <reason>
+⏭ SKIPPED: <title> at <company> — <reason>"""
 
 ALL_TOOLS = [
     fetch_full_jd,
@@ -283,8 +295,19 @@ JOBS TO APPLY:
     "skills_required": j.get("skills_required", []),
 } for j in batch], indent=2)}
 
-For each job: check_already_applied → build_resume → apply_to_job → record_application → save_resume_to_repo
-Use the full UUID from build_resume result as resume_id."""
+For EACH job follow this exact order:
+1. check_already_applied → skip if true
+2. get_portal_credentials → get account
+3. build_resume → generate PDF
+4. apply_to_job → submit (note the "error" field if it fails)
+5. save_resume_to_repo → get resume_id UUID
+6. record_application → use resume_id from step 5, set status from apply_to_job result:
+   - success=True → status="APPLIED"
+   - status="SKIPPED" → status="SKIPPED"
+   - success=False → status="FAILED", error_message=<copy "error" field from apply_to_job>
+
+NEVER call record_application before save_resume_to_repo.
+ALWAYS pass error_message when FAILED."""
 
         try:
             messages = [HumanMessage(content=prompt)]

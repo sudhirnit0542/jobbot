@@ -148,7 +148,15 @@ async def save_application(data: dict) -> dict:
 
         try:
             r = supabase.table("applications").upsert(data).execute()
-            return r.data[0] if r.data else {}
+            saved = r.data[0] if r.data else {}
+            status = data.get("status", "?")
+            job_id = data.get("job_id", "?")
+            err_msg = data.get("error_message", "")
+            if err_msg:
+                logger.info(f"💾 Application saved: {status} | job={job_id} | error='{err_msg[:120]}'")
+            else:
+                logger.info(f"💾 Application saved: {status} | job={job_id}")
+            return saved
         except Exception as e:
             err = str(e)
             # FK violation — resume not saved yet, retry without resume_id
@@ -156,7 +164,9 @@ async def save_application(data: dict) -> dict:
                 logger.warning("save_application: resume FK violation — retrying without resume_id")
                 data.pop("resume_id", None)
                 r = supabase.table("applications").upsert(data).execute()
-                return r.data[0] if r.data else {}
+                saved = r.data[0] if r.data else {}
+                logger.info(f"💾 Application saved (no resume_id): {data.get('status')} | job={data.get('job_id')}")
+                return saved
             raise e
     except Exception as e:
         logger.error(f"save_application error: {e}")
