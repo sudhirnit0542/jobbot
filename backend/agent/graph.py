@@ -156,14 +156,14 @@ def build_model_chain() -> list[dict]:
         except Exception as e:
             logger.warning(f"⚠️ Gemini unavailable: {e}")
 
-    # ── 3. Zhipu glm-4.7-flash (third — free, generous limits) ──
+    # ── 3. Zhipu GLM-4-Flash (third — free, generous limits) ──
     if settings.zhipu_api_key:
         try:
             from langchain_openai import ChatOpenAI
             models.append({
-                "name": "Zhipu / glm-4.7-flash",
+                "name": "Zhipu / glm-4-flash",
                 "llm": ChatOpenAI(
-                    model="glm-4.7-flash",
+                    model="glm-4-flash",
                     api_key=settings.zhipu_api_key,
                     base_url="https://open.bigmodel.cn/api/paas/v4/",
                     max_tokens=4096,
@@ -254,7 +254,18 @@ async def run_auto_apply(
     has_pdf_cv = (candidate.get("base_resume_text") or "").startswith("PDF:")
     candidate_display = {k: v for k, v in candidate.items() if k != "base_resume_text"}
 
-    prompt = f"""Apply to these {len(jobs)} pre-matched jobs for this candidate.
+    # Process in batches of 4 to stay within recursion limits
+    # Each job needs ~8 tool calls; 4 jobs × 8 = 32 + buffer = 60
+    BATCH_SIZE = 4
+    all_responses = []
+
+    for batch_start in range(0, len(jobs), BATCH_SIZE):
+        batch = jobs[batch_start:batch_start + BATCH_SIZE]
+        batch_num = batch_start // BATCH_SIZE + 1
+        total_batches = (len(jobs) + BATCH_SIZE - 1) // BATCH_SIZE
+        logger.info(f"🔄 Processing batch {batch_num}/{total_batches} ({len(batch)} jobs)")
+
+        prompt = f"""Apply to these {len(batch)} pre-matched jobs for this candidate. (Batch {batch_num} of {total_batches})
 
 CANDIDATE:
 {json.dumps(candidate_display, indent=2)}
@@ -270,16 +281,28 @@ JOBS TO APPLY:
     "apply_url": j.get("apply_url"),
     "description": (j.get("description") or "")[:400],
     "skills_required": j.get("skills_required", []),
-} for j in jobs], indent=2)}
+} for j in batch], indent=2)}
 
-Process each job. Use the full UUID from build_resume as resume_id."""
+For each job: check_already_applied → build_resume → apply_to_job → record_application → save_resume_to_repo
+Use the full UUID from build_resume result as resume_id."""
 
-    messages = [HumanMessage(content=prompt)]
-    result = await job_agent.ainvoke({"messages": messages})
-    response = result["messages"][-1].content
+        try:
+            messages = [HumanMessage(content=prompt)]
+            recursion_limit = max(60, len(batch) * 12 + 20)
+            result = await job_agent.ainvoke(
+                {"messages": messages},
+                config={"recursion_limit": recursion_limit}
+            )
+            batch_response = result["messages"][-1].content
+            all_responses.append(f"Batch {batch_num}: {batch_response}")
+            logger.info(f"✅ Batch {batch_num} complete")
+        except Exception as e:
+            logger.error(f"❌ Batch {batch_num} failed: {e}")
+            all_responses.append(f"Batch {batch_num} failed: {str(e)}")
 
+    response = "\n\n".join(all_responses)
     updated_history = history + [
-        {"role": "user", "content": prompt},
+        {"role": "user", "content": f"Applied to {len(jobs)} jobs in {len(all_responses)} batches"},
         {"role": "assistant", "content": response}
     ]
     return response, updated_history
@@ -292,6 +315,9 @@ async def run_job_search(candidate: dict, job_query: str, location: str = "India
     history = history or []
     prompt = f"Search and apply for {job_query} jobs in {location} for candidate: {json.dumps(candidate, indent=2)}"
     messages = [HumanMessage(content=prompt)]
-    result = await job_agent.ainvoke({"messages": messages})
+    result = await job_agent.ainvoke(
+        {"messages": messages},
+        config={"recursion_limit": 150}
+    )
     response = result["messages"][-1].content
     return response, history + [{"role": "user", "content": prompt}, {"role": "assistant", "content": response}]
