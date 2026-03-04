@@ -139,13 +139,35 @@ def get_candidate_id_for_user(user: dict) -> str:
 
 app = FastAPI(title="JobBot API", version="1.0.0")
 
+# Build origins list — always include localhost for dev
+_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+if not _origins:
+    _origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins.split(","),
+    allow_origins=_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin",
+                   "X-Requested-With", "Access-Control-Request-Method",
+                   "Access-Control-Request-Headers"],
+    expose_headers=["*"],
+    max_age=3600,
 )
+
+
+
+# ─── Debug / health ───────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/auth/me")
+async def auth_me(user: dict = Depends(get_current_user)):
+    """Test endpoint — returns decoded JWT payload so you can verify auth works."""
+    return {"authenticated": True, "user_id": user.get("sub"), "email": user.get("email")}
 
 
 # ─── Models ───────────────────────────────────────────────────────────────────
@@ -187,24 +209,37 @@ async def health():
 @app.post("/candidate")
 async def save_candidate(profile: CandidateProfile, user: dict = Depends(get_current_user)):
     """Save or update candidate profile."""
-    data = profile.dict()
-    data["user_id"] = user.get("sub")  # Link to Supabase auth user
+    try:
+        data = profile.dict()
+        user_id = user.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Could not identify user from token")
+        data["user_id"] = user_id
 
-    # Build base_resume_text from profile fields
-    skills_text = ", ".join(data.get("skills", []))
-    exp_text = " | ".join([
-        f"{e.get('role', '')} at {e.get('company', '')} ({e.get('duration', '')}): "
-        f"{e.get('description', '')} {' '.join(e.get('achievements', []))}"
-        for e in data.get("experience", [])
-    ])
+        # Build base_resume_text from profile fields
+        skills_text = ", ".join(data.get("skills", []))
+        exp_text = " | ".join([
+            f"{e.get('role', '')} at {e.get('company', '')} ({e.get('duration', '')}): "
+            f"{e.get('description', '')} {' '.join(e.get('achievements', []))}"
+            for e in data.get("experience", [])
+        ])
 
-    # Don't overwrite PDF CV if already uploaded
-    existing = get_candidate_by_email(data["email"])
-    if not existing or not (existing.get("base_resume_text") or "").startswith("PDF:"):
-        data["base_resume_text"] = f"{data['summary']}\nSkills: {skills_text}\nExperience: {exp_text}"
+        # Don't overwrite PDF CV if already uploaded
+        existing = get_candidate_by_email(data["email"])
+        if not existing or not (existing.get("base_resume_text") or "").startswith("PDF:"):
+            data["base_resume_text"] = f"{data['summary']}\nSkills: {skills_text}\nExperience: {exp_text}"
 
-    saved = upsert_candidate(data)
-    return {"success": True, "candidate": saved}
+        logger.info(f"Saving candidate user_id={user_id} email={data.get('email')}")
+        saved = upsert_candidate(data)
+        if not saved:
+            raise HTTPException(status_code=500, detail="Failed to save candidate — check Supabase logs")
+        logger.info(f"Candidate saved: id={saved.get('id')}")
+        return {"success": True, "candidate": saved}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"save_candidate error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/candidate/me")
